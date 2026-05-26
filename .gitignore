@@ -1,0 +1,11 @@
+.env
+data/
+__pycache__/
+*.pyc
+*.joblib
+*.egg-info/
+.venv/
+venv/
+.claude/
+# stubs are committed — they're part of dev tooling, not generated artifacts
+

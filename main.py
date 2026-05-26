@@ -1,0 +1,498 @@
+"""
+main.py — Bot entry point and job scheduler.
+
+Architecture changes from original:
+
+1. Single MT5 connection:
+   session.connect() called once here at startup.
+   All modules share the same MT5Session singleton.
+   No module creates or destroys MT5 connections independently.
+
+2. Startup reconciliation:
+   reconcile() runs before any job fires.
+   Detects positions closed during downtime (SL/TP hit while bot was offline).
+   Detects orphan positions opened outside the bot.
+
+3. Session equity baseline:
+   circuit_breaker.initialize_session() records starting equity once.
+   All subsequent drawdown calculations are relative to this baseline.
+
+4. Execution pipeline (auto_execute_job):
+   circuit_breaker.check()   → halt if daily loss/drawdown limits hit
+   exposure_gate.check_entry() → halt if position/risk/correlation limits hit
+   spread_filter              → skip if spread too wide
+   session_filter             → skip if outside trading hours for pair
+   order_engine.market_order() → execute with retry, capture actual fill price
+   position_store.open_position() → atomic write with actual fill price
+
+5. Periodic reconciler job (every 5 minutes):
+   Catches any positions that slipped through normal monitor.
+   Safety net against state desync.
+
+6. Bot_data removed from position tracking:
+   All state is in position_store (file) and circuit_breaker (singleton).
+   Telegram context.bot_data is only used for UI state (auto_mode_active,
+   auto_exec_active, top_symbols_cache, scan_alerted cooldowns).
+"""
+
+import logging
+import time
+from datetime import datetime, timezone
+
+from telegram.ext import ApplicationBuilder, CallbackQueryHandler, CommandHandler
+
+from config import settings
+from core.connection.mt5_session import session
+from core.monitoring.position_monitor import run as monitor_run
+from core.risk.circuit_breaker import circuit_breaker
+from core.risk.exposure_gate import check_entry
+from core.risk.session_filter import is_valid_session
+from core.risk.spread_filter import is_spread_acceptable
+from core.state.position_store import (
+    has_open_position, open_position,
+)
+from core.state.reconciler import reconcile
+from telegram_interface import bot_handlers
+
+logging.basicConfig(
+    format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    level=logging.INFO,
+)
+log = logging.getLogger(__name__)
+
+AUTO_SCAN_INTERVAL    = 60
+TP_MONITOR_INTERVAL   = 30
+RECONCILE_INTERVAL    = settings.RECONCILE_INTERVAL  # 300s
+TOP_SYMBOLS_N         = settings.TOP_SYMBOLS_N
+TOP_SYMBOLS_CACHE_TTL = settings.TOP_SYMBOLS_CACHE_TTL
+
+
+# ── Symbol cache helpers ────────────────────────────────────────────────────
+
+def _get_scan_symbols(context, broker) -> list[str]:
+    cache = context.bot_data.setdefault("top_symbols_cache", {})
+    if time.time() - cache.get("refreshed_at", 0) > TOP_SYMBOLS_CACHE_TTL:
+        symbols = broker.get_top_symbols(n=TOP_SYMBOLS_N)
+        if symbols:
+            cache["symbols"]      = symbols
+            cache["refreshed_at"] = time.time()
+            log.info("Symbols refreshed: %s", symbols)
+    return cache.get("symbols") or ["EURUSD", "GBPUSD", "USDJPY"]
+
+
+# ── Composite signal scoring ────────────────────────────────────────────────
+
+def _compute_composite(signals: dict) -> tuple[int, int]:
+    """Returns (composite_score, threshold). |score| must reach threshold to act."""
+    regime = signals.get("regime", "transition")
+    rsi    = signals.get("rsi", 50.0)
+
+    if regime == "trending":
+        ema_s = 1 if signals["ema_trend"] == "bullish" else (-1 if signals["ema_trend"] == "bearish" else 0)
+        rsi_s = 1 if rsi >= 55 else (-1 if rsi <= 45 else 0)
+        dmp, dmn = signals.get("dmp", 0), signals.get("dmn", 0)
+        di_s  = 1 if dmp > dmn else (-1 if dmn > dmp else 0)
+        return ema_s + rsi_s + di_s, 2
+
+    elif regime == "ranging":
+        rsi_s = 1 if rsi <= 35 else (-1 if rsi >= 65 else 0)
+        bb_s  = 1 if signals.get("bb_percent", 0.5) <= 0.15 else (-1 if signals.get("bb_percent", 0.5) >= 0.85 else 0)
+        return rsi_s + bb_s, 2
+
+    else:  # transition — no entry
+        return 0, 99
+
+
+# ── Job: TP/SL monitor ──────────────────────────────────────────────────────
+
+async def tp_monitor_job(context) -> None:
+    """
+    Detect positions closed by SL/TP on broker side.
+    Send proximity alerts for approaching TP/SL.
+    Uses deal history for accurate exit price and PnL.
+    """
+    chat_id = settings.TELEGRAM_CHAT_ID
+
+    async def send(text: str) -> None:
+        await context.bot.send_message(chat_id=chat_id, text=text)
+
+    try:
+        await monitor_run(send)
+    except Exception as exc:
+        log.error("tp_monitor_job error: %s", exc, exc_info=True)
+
+
+# ── Job: Periodic reconciler ────────────────────────────────────────────────
+
+async def reconcile_job(context) -> None:
+    """
+    Periodic safety net: sync local state vs MT5 every 5 minutes.
+    Handles positions missed by tp_monitor (connection gaps, etc).
+    """
+    try:
+        summary = reconcile()
+        if summary["closed"] > 0 or summary["orphans"] > 0:
+            await context.bot.send_message(
+                chat_id=settings.TELEGRAM_CHAT_ID,
+                text=(
+                    f"🔄 Rekonsiliasi otomatis:\n"
+                    f"Ditutup : {summary['closed']}\n"
+                    f"Orphan  : {summary['orphans']}\n"
+                    f"Match   : {summary['matched']}"
+                ),
+            )
+    except Exception as exc:
+        log.error("reconcile_job error: %s", exc, exc_info=True)
+
+
+# ── Job: Alert-only scan ────────────────────────────────────────────────────
+
+async def auto_trading_job(context) -> None:
+    """Scan symbols and send analysis alerts — no order execution."""
+    if not context.bot_data.get("auto_mode_active", False):
+        return
+
+    from strategy.indicators import IndicatorManager
+    from strategy.ml_model import MLModel
+    from ai_reasoner.analyzer import AIAnalyzer
+    from core.mt5_broker import MT5BrokerManager
+
+    broker   = MT5BrokerManager()
+    ml_model = MLModel()
+    analyzer = AIAnalyzer()
+    chat_id  = settings.TELEGRAM_CHAT_ID
+
+    for symbol in _get_scan_symbols(context, broker):
+        try:
+            df = broker.fetch_ohlcv(symbol)
+            if df.empty:
+                continue
+            df      = IndicatorManager.add_indicators(df)
+            signals = IndicatorManager.get_latest_signals(df)
+            if signals is None:
+                continue
+
+            composite, threshold = _compute_composite(signals)
+            if abs(composite) < threshold:
+                continue
+
+            df_4h    = broker.fetch_ohlcv(symbol, "4h", 60)
+            htf_bias = "neutral"
+            if not df_4h.empty:
+                df_4h    = IndicatorManager.add_indicators(df_4h)
+                htf_bias = IndicatorManager.get_htf_bias(df_4h)["bias"]
+
+            if composite > 0 and htf_bias != "bullish":
+                continue
+            if composite < 0 and htf_bias != "bearish":
+                continue
+
+            # 4-hour cooldown per symbol
+            scan_alerts = context.bot_data.setdefault("scan_alerted", {})
+            if time.time() - scan_alerts.get(symbol, 0) < 4 * 3600:
+                continue
+            scan_alerts[symbol] = time.time()
+
+            prediction = ml_model.predict(df)
+            analysis   = analyzer.analyze(symbol, signals, prediction)
+            bias_emoji = {"bullish": "🟢", "bearish": "🔴"}.get(htf_bias, "⚪")
+
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"🔔 AUTO SCAN — {symbol}\n{bias_emoji} 4h: {htf_bias.upper()}\n\n{analysis}",
+            )
+        except Exception as exc:
+            log.error("auto_trading_job error on %s: %s", symbol, exc, exc_info=True)
+
+
+# ── Job: Auto execute ───────────────────────────────────────────────────────
+
+async def auto_execute_job(context) -> None:
+    """
+    Full autonomous BUY/SELL execution pipeline.
+
+    Gate sequence (all must pass):
+    1. circuit_breaker.check()    — daily loss / drawdown limits
+    2. exposure_gate.check_entry() — position count / total risk% / correlation
+    3. is_valid_session()          — trading hours for this pair
+    4. is_spread_acceptable()      — current spread within limits
+    5. Signal composite threshold  — indicator agreement
+    6. HTF 4H alignment            — higher timeframe confirmation
+    """
+    if not context.bot_data.get("auto_exec_active", False):
+        return
+
+    from strategy.indicators import IndicatorManager
+    from strategy.ml_model import MLModel
+    from ai_reasoner.analyzer import AIAnalyzer
+    from core.mt5_broker import MT5BrokerManager
+    from core.risk_manager import RiskManager
+    from core.execution.order_engine import OrderEngine
+
+    broker    = MT5BrokerManager()
+    ml_model  = MLModel()
+    analyzer  = AIAnalyzer()
+    engine    = OrderEngine()
+    chat_id   = settings.TELEGRAM_CHAT_ID
+
+    # Gate 1: circuit breaker — check before scanning any symbols
+    allowed, reason = circuit_breaker.check()
+    if not allowed:
+        log.warning("Auto-exec blocked by circuit breaker: %s", reason)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"🚫 Auto-exec diblokir circuit breaker:\n{reason}",
+        )
+        context.bot_data["auto_exec_active"] = False
+        return
+
+    for symbol in _get_scan_symbols(context, broker):
+        try:
+            await _execute_for_symbol(
+                symbol, context, broker, ml_model, analyzer, engine, chat_id
+            )
+        except Exception as exc:
+            log.error("auto_execute_job error on %s: %s", symbol, exc, exc_info=True)
+
+
+async def _execute_for_symbol(
+    symbol, context, broker, ml_model, analyzer, engine, chat_id
+) -> None:
+    from strategy.indicators import IndicatorManager
+    from core.risk_manager import RiskManager
+
+    # Gate 2 (partial): symbol-level position check
+    if has_open_position(symbol):
+        return
+
+    # Gate 3: session filter
+    if not is_valid_session(symbol):
+        return
+
+    # Gate 4: spread filter
+    if not is_spread_acceptable(symbol):
+        return
+
+    # Signal pipeline
+    df = broker.fetch_ohlcv(symbol, "1h", 100)
+    if df.empty:
+        return
+    df      = IndicatorManager.add_indicators(df)
+    signals = IndicatorManager.get_latest_signals(df)
+    if signals is None:
+        return
+
+    composite, threshold = _compute_composite(signals)
+    if abs(composite) < threshold:
+        return
+
+    # HTF 4H confirmation
+    df_4h    = broker.fetch_ohlcv(symbol, "4h", 60)
+    htf_bias = "neutral"
+    if not df_4h.empty:
+        df_4h    = IndicatorManager.add_indicators(df_4h)
+        htf_bias = IndicatorManager.get_htf_bias(df_4h)["bias"]
+
+    if composite > 0 and htf_bias != "bullish":
+        return
+    if composite < 0 and htf_bias != "bearish":
+        return
+
+    side = "buy" if composite > 0 else "sell"
+
+    # Calculate SL/TP using current price estimate for sizing
+    # Actual fill price will be captured from order result
+    tick = session.get_tick(symbol)
+    if tick is None:
+        return
+
+    estimated_entry = tick.ask if side == "buy" else tick.bid
+    balance         = broker.get_balance()
+    risk_mgr        = RiskManager(balance)
+    atr             = signals.get("atr", 0)
+
+    from core.risk_manager import RiskManager as RM
+    sl_price, tp_price = (
+        RM.get_sl_tp_atr(estimated_entry, atr, side)
+        if atr > 0
+        else RM.get_sl_tp_pips(symbol, estimated_entry, side)
+    )
+
+    lot_size = risk_mgr.calculate_position_size(symbol, estimated_entry, sl_price)
+    risk_usd = risk_mgr.calculate_risk_usd(symbol, estimated_entry, sl_price, lot_size)
+
+    # Gate 2 (full): exposure check with actual risk_usd
+    gate = check_entry(symbol, risk_usd)
+    if not gate.allowed:
+        log.info("ExposureGate rejected %s: %s", symbol, gate.reason)
+        return
+
+    # Execute order — retry handled inside engine
+    fill = engine.market_order(symbol, side, lot_size, sl=sl_price, tp=tp_price)
+    if fill is None:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"⚠️ AUTO EXEC gagal: {symbol} {side.upper()} — lihat log.",
+        )
+        return
+
+    # Record with ACTUAL fill price (not estimated_entry)
+    equity = broker.get_equity()
+    open_position(
+        ticket=fill.ticket,
+        symbol=symbol,
+        side=side,
+        fill_price=fill.fill_price,   # ← actual fill from broker
+        sl_price=sl_price,
+        tp_price=tp_price,
+        lot_size=fill.volume,
+        risk_usd=risk_usd,
+        equity_at_open=equity,
+    )
+
+    # Notification
+    prediction = ml_model.predict(df)
+    analysis   = analyzer.analyze(symbol, signals, prediction)
+    from core.risk_manager import RiskManager as RM2
+    pip_mult   = RM2.pip_multiplier(symbol)
+    sl_pips    = abs(fill.fill_price - sl_price) / pip_mult
+    tp_pips    = abs(tp_price - fill.fill_price) / pip_mult
+    direction  = "BUY ↑" if side == "buy" else "SELL ↓"
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"🤖 AUTO EXEC — {direction} {symbol}\n\n"
+            f"Fill  : {fill.fill_price:.5f}\n"
+            f"SL    : {sl_price:.5f}  ({sl_pips:.0f} pip)\n"
+            f"TP    : {tp_price:.5f}  ({tp_pips:.0f} pip)\n"
+            f"Lot   : {fill.volume:.2f}\n"
+            f"Risk  : ${risk_usd:.2f}\n"
+            f"Ticket: {fill.ticket}\n\n"
+            f"Score : {composite:+d}  Regime: {signals.get('regime','?').upper()}\n"
+            f"ML    : {prediction}\n\n"
+            f"/close {symbol} untuk exit manual."
+        ),
+    )
+
+
+# ── Job: Weekend position close ─────────────────────────────────────────────
+
+async def weekend_close_job(context) -> None:
+    """Close all positions Friday 14:00 UTC to avoid weekend gap risk."""
+    now = datetime.now(timezone.utc)
+    if now.weekday() != 4:          # not Friday
+        return
+    if now.hour != settings.WEEKEND_CLOSE_HOUR_UTC:
+        return
+    if now.minute > 5:              # only within first 5 minutes of the hour
+        return
+
+    from core.mt5_broker import MT5BrokerManager
+    broker    = MT5BrokerManager()
+    positions = broker.fetch_open_positions()
+    if not positions:
+        return
+
+    await context.bot.send_message(
+        chat_id=settings.TELEGRAM_CHAT_ID,
+        text=f"⏰ WEEKEND CLOSE — menutup {len(positions)} posisi.",
+    )
+    count = broker.close_all_positions()
+    # Reconcile immediately after mass close to update position store and journal
+    reconcile()
+    await context.bot.send_message(
+        chat_id=settings.TELEGRAM_CHAT_ID,
+        text=f"✅ {count} posisi ditutup. State tersinkron.",
+    )
+
+
+# ── Auto mode toggle commands ────────────────────────────────────────────────
+
+async def auto_on(update, context) -> None:
+    context.bot_data["auto_mode_active"] = True
+    cached     = context.bot_data.get("top_symbols_cache", {}).get("symbols")
+    scan_label = ", ".join(cached) if cached else "loading..."
+    await update.message.reply_text(
+        f"✅ Auto Scan AKTIF.\nScan: {scan_label}\n\n/auto_exec_on untuk eksekusi."
+    )
+
+
+async def auto_off(update, context) -> None:
+    context.bot_data["auto_mode_active"] = False
+    await update.message.reply_text("🛑 Auto Scan DIMATIKAN.")
+
+
+async def auto_exec_on(update, context) -> None:
+    context.bot_data["auto_exec_active"] = True
+    cb_status  = circuit_breaker.status()
+    cached     = context.bot_data.get("top_symbols_cache", {}).get("symbols")
+    scan_label = ", ".join(cached) if cached else "loading..."
+    await update.message.reply_text(
+        f"⚡ AUTO EXECUTE AKTIF (BUY & SELL).\n\n"
+        f"Gate aktif:\n"
+        f"  • Circuit breaker (RR limit {cb_status['rr_limit']:+.1f}, DD {cb_status['dd_limit']}%)\n"
+        f"  • Exposure gate (max 5 posisi, 5% total risk)\n"
+        f"  • Spread filter\n"
+        f"  • Session filter\n"
+        f"  • Composite ≥ threshold + 4H konfirmasi\n\n"
+        f"Scan: {scan_label}\n"
+        f"⚠️  Monitor posisi secara berkala!\n\n"
+        f"/auto_exec_off untuk matikan."
+    )
+
+
+async def auto_exec_off(update, context) -> None:
+    context.bot_data["auto_exec_active"] = False
+    await update.message.reply_text("🛑 Auto Execute DIMATIKAN.")
+
+
+# ── Entry point ──────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    # Step 1: Establish MT5 connection — fail fast if cannot connect
+    log.info("Connecting to MT5...")
+    if not session.connect():
+        log.critical("Cannot connect to MT5 — aborting startup")
+        raise SystemExit(1)
+
+    # Step 2: Record session baseline equity for drawdown tracking
+    circuit_breaker.initialize_session()
+
+    # Step 3: Reconcile local state vs MT5 before any job fires
+    log.info("Running startup reconciliation...")
+    startup_sync = reconcile()
+    log.info("Startup reconcile: %s", startup_sync)
+
+    # Step 4: Build Telegram application
+    application = (
+        ApplicationBuilder()
+        .token(settings.TELEGRAM_BOT_TOKEN)
+        .build()
+    )
+
+    # Register command handlers
+    application.add_handler(CommandHandler("start",         bot_handlers.start))
+    application.add_handler(CommandHandler("balance",       bot_handlers.balance))
+    application.add_handler(CommandHandler("analyze",       bot_handlers.analyze_command))
+    application.add_handler(CommandHandler("status",        bot_handlers.status_command))
+    application.add_handler(CommandHandler("close",         bot_handlers.close_command))
+    application.add_handler(CommandHandler("closeall",      bot_handlers.closeall_command))
+    application.add_handler(CommandHandler("train",         bot_handlers.train_command))
+    application.add_handler(CommandHandler("report",        bot_handlers.report_command))
+    application.add_handler(CommandHandler("auto_on",       auto_on))
+    application.add_handler(CommandHandler("auto_off",      auto_off))
+    application.add_handler(CommandHandler("auto_exec_on",  auto_exec_on))
+    application.add_handler(CommandHandler("auto_exec_off", auto_exec_off))
+    application.add_handler(CallbackQueryHandler(bot_handlers.button_handler))
+
+    # Register recurring jobs
+    jq = application.job_queue
+    jq.run_repeating(tp_monitor_job,   interval=TP_MONITOR_INTERVAL,  first=15)
+    jq.run_repeating(reconcile_job,    interval=RECONCILE_INTERVAL,   first=60)
+    jq.run_repeating(auto_trading_job, interval=AUTO_SCAN_INTERVAL,   first=10)
+    jq.run_repeating(auto_execute_job, interval=AUTO_SCAN_INTERVAL,   first=20)
+    jq.run_repeating(weekend_close_job, interval=60,                  first=30)
+
+    log.info("Forex Bot MT5 starting — polling Telegram")
+    application.run_polling()
