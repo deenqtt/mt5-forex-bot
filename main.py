@@ -52,6 +52,7 @@ from core.state.position_store import (
     has_open_position, open_position,
 )
 from core.state.reconciler import reconcile
+from core.state.bot_state import load_bot_state, save_bot_state, clear_circuit_breaker_flag
 from telegram_interface import bot_handlers
 
 logging.basicConfig(
@@ -239,11 +240,22 @@ async def auto_execute_job(context) -> None:
     allowed, reason = circuit_breaker.check()
     if not allowed:
         log.warning("Auto-exec blocked by circuit breaker: %s", reason)
+        context.bot_data["auto_exec_active"] = False
+        # Persist: next restart user sees WHY auto_exec was disabled
+        save_bot_state(
+            auto_scan=context.bot_data.get("auto_mode_active", False),
+            auto_exec=False,
+            stopped_by_circuit_breaker=True,
+            circuit_breaker_reason=reason,
+        )
         await context.bot.send_message(
             chat_id=chat_id,
-            text=f"🚫 Auto-exec diblokir circuit breaker:\n{reason}",
+            text=(
+                f"🚫 Circuit breaker — Auto Execute DIMATIKAN.\n\n"
+                f"Alasan: {reason}\n\n"
+                f"Gunakan /auto_exec_on untuk aktifkan kembali setelah mengevaluasi."
+            ),
         )
-        context.bot_data["auto_exec_active"] = False
         return
 
     for symbol in _get_scan_symbols(context, broker):
@@ -258,6 +270,29 @@ async def auto_execute_job(context) -> None:
 async def _execute_for_symbol(
     symbol, context, broker, ml_model, analyzer, engine, chat_id
 ) -> None:
+    from strategy.indicators import IndicatorManager
+    from core.risk_manager import RiskManager
+    from core.execution.order_engine import get_symbol_lock
+
+    # Per-symbol async lock: prevents duplicate order race condition.
+    # Now that engine.market_order() is async (has await points), asyncio can
+    # switch tasks between check_entry() and open_position(). The lock ensures
+    # only one execution path runs per symbol at any given time.
+    lock = get_symbol_lock(symbol)
+    if lock.locked():
+        # Another coroutine is already executing for this symbol — skip silently
+        return
+
+    async with lock:
+        await _execute_for_symbol_locked(
+            symbol, context, broker, ml_model, analyzer, engine, chat_id
+        )
+
+
+async def _execute_for_symbol_locked(
+    symbol, context, broker, ml_model, analyzer, engine, chat_id
+) -> None:
+    """Inner execution — called while holding per-symbol lock."""
     from strategy.indicators import IndicatorManager
     from core.risk_manager import RiskManager
 
@@ -321,14 +356,14 @@ async def _execute_for_symbol(
     lot_size = risk_mgr.calculate_position_size(symbol, estimated_entry, sl_price)
     risk_usd = risk_mgr.calculate_risk_usd(symbol, estimated_entry, sl_price, lot_size)
 
-    # Gate 2 (full): exposure check with actual risk_usd
-    gate = check_entry(symbol, risk_usd)
+    # Gate 2 (full): exposure check with actual risk_usd + SL/TP for stop level validation
+    gate = check_entry(symbol, risk_usd, sl=sl_price, tp=tp_price)
     if not gate.allowed:
         log.info("ExposureGate rejected %s: %s", symbol, gate.reason)
         return
 
-    # Execute order — retry handled inside engine
-    fill = engine.market_order(symbol, side, lot_size, sl=sl_price, tp=tp_price)
+    # Execute order — async retry, does not block event loop during backoff
+    fill = await engine.market_order(symbol, side, lot_size, sl=sl_price, tp=tp_price)
     if fill is None:
         await context.bot.send_message(
             chat_id=chat_id,
@@ -398,7 +433,7 @@ async def weekend_close_job(context) -> None:
         chat_id=settings.TELEGRAM_CHAT_ID,
         text=f"⏰ WEEKEND CLOSE — menutup {len(positions)} posisi.",
     )
-    count = broker.close_all_positions()
+    count = await broker.close_all_positions()
     # Reconcile immediately after mass close to update position store and journal
     reconcile()
     await context.bot.send_message(
@@ -409,22 +444,13 @@ async def weekend_close_job(context) -> None:
 
 # ── Auto mode toggle commands ────────────────────────────────────────────────
 
-async def auto_on(update, context) -> None:
-    context.bot_data["auto_mode_active"] = True
-    cached     = context.bot_data.get("top_symbols_cache", {}).get("symbols")
-    scan_label = ", ".join(cached) if cached else "loading..."
-    await update.message.reply_text(
-        f"✅ Auto Scan AKTIF.\nScan: {scan_label}\n\n/auto_exec_on untuk eksekusi."
-    )
-
-
-async def auto_off(update, context) -> None:
-    context.bot_data["auto_mode_active"] = False
-    await update.message.reply_text("🛑 Auto Scan DIMATIKAN.")
-
-
 async def auto_exec_on(update, context) -> None:
     context.bot_data["auto_exec_active"] = True
+    clear_circuit_breaker_flag()
+    save_bot_state(
+        auto_scan=context.bot_data.get("auto_mode_active", False),
+        auto_exec=True,
+    )
     cb_status  = circuit_breaker.status()
     cached     = context.bot_data.get("top_symbols_cache", {}).get("symbols")
     scan_label = ", ".join(cached) if cached else "loading..."
@@ -444,7 +470,41 @@ async def auto_exec_on(update, context) -> None:
 
 async def auto_exec_off(update, context) -> None:
     context.bot_data["auto_exec_active"] = False
+    save_bot_state(
+        auto_scan=context.bot_data.get("auto_mode_active", False),
+        auto_exec=False,
+    )
     await update.message.reply_text("🛑 Auto Execute DIMATIKAN.")
+
+
+async def auto_on(update, context) -> None:
+    context.bot_data["auto_mode_active"] = True
+    save_bot_state(auto_scan=True, auto_exec=context.bot_data.get("auto_exec_active", False))
+    cached     = context.bot_data.get("top_symbols_cache", {}).get("symbols")
+    scan_label = ", ".join(cached) if cached else "loading..."
+    await update.message.reply_text(
+        f"✅ Auto Scan AKTIF.\nScan: {scan_label}\n\n/auto_exec_on untuk eksekusi."
+    )
+
+
+async def auto_off(update, context) -> None:
+    context.bot_data["auto_mode_active"] = False
+    save_bot_state(auto_scan=False, auto_exec=context.bot_data.get("auto_exec_active", False))
+    await update.message.reply_text("🛑 Auto Scan DIMATIKAN.")
+
+
+def _should_weekend_close_now() -> bool:
+    """
+    True if it's Friday AFTER the close hour (handles restart edge case).
+    Original weekend_close_job only triggers at exactly the configured hour.
+    If bot restarts at 15:00 Friday (after 14:00 close window), it misses close.
+    This check fires on startup: if Friday + past close time + positions open → close now.
+    """
+    now = datetime.now(timezone.utc)
+    return (
+        now.weekday() == 4 and           # Friday
+        now.hour >= settings.WEEKEND_CLOSE_HOUR_UTC
+    )
 
 
 # ── Entry point ──────────────────────────────────────────────────────────────
@@ -463,6 +523,23 @@ if __name__ == "__main__":
     log.info("Running startup reconciliation...")
     startup_sync = reconcile()
     log.info("Startup reconcile: %s", startup_sync)
+
+    # Step 4: Weekend close startup check
+    # Handles case where bot was restarted on Friday after the close window.
+    # Normal weekend_close_job would not fire until next Friday.
+    if _should_weekend_close_now():
+        from core.mt5_broker import MT5BrokerManager as _MB
+        _broker   = _MB()
+        _open_pos = _broker.fetch_open_positions()
+        if _open_pos:
+            log.warning(
+                "Startup weekend close: %d positions still open on Friday post-close-time",
+                len(_open_pos),
+            )
+            import asyncio as _asyncio
+            _asyncio.run(_broker.close_all_positions())
+            reconcile()
+            log.info("Startup weekend close: positions closed and reconciled")
 
     # Step 4: Build Telegram application
     application = (

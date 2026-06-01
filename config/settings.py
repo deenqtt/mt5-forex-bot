@@ -50,9 +50,12 @@ AUTO_EXEC_DAILY_USD_LIMIT     = None   # optional: halt if USD loss ≤ this (e.
 AUTO_EXEC_EQUITY_DRAWDOWN_PCT = 5.0    # halt if equity drops ≥ this % from session start
 
 # Exposure limits
-MAX_OPEN_POSITIONS = 5      # hard cap on simultaneous positions
-MAX_TOTAL_RISK_PCT = 5.0    # total open risk as % of equity
-MAX_CORRELATED     = 2      # max positions from same correlation group
+MAX_OPEN_POSITIONS  = 5      # hard cap on simultaneous positions
+MAX_TOTAL_RISK_PCT  = 5.0    # total open risk as % of equity
+MAX_CORRELATED      = 2      # max positions from same correlation group
+MIN_MARGIN_LEVEL_PCT = 300.0 # halt new entries if margin level < this %
+                              # Exness Standard margin call = 100%, buffer 3×
+                              # Exness Pro margin call = 50%, buffer 6×
 
 # Scan config
 TOP_SYMBOLS_N        = 10

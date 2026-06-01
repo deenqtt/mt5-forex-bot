@@ -126,7 +126,7 @@ class MT5BrokerManager:
 
     # ── Legacy execution wrappers (prefer OrderEngine directly) ───────────
 
-    def create_market_order(
+    async def create_market_order(
         self,
         symbol: str,
         side: str,
@@ -136,13 +136,12 @@ class MT5BrokerManager:
         comment: str = "forex_bot",
     ) -> dict | None:
         """
-        Legacy wrapper — delegates to OrderEngine.
-        Returns minimal dict for backward compat: {"id", "price", "volume"}.
-        New code should call OrderEngine.market_order() directly to get FillResult.
+        Legacy async wrapper — delegates to OrderEngine.
+        Must be awaited. New code should call OrderEngine.market_order() directly.
         """
         from core.execution.order_engine import OrderEngine
         engine = OrderEngine()
-        fill = engine.market_order(symbol, side, amount, sl, tp, comment=comment)
+        fill = await engine.market_order(symbol, side, amount, sl, tp, comment=comment)
         if fill is None:
             return None
         return {"id": fill.ticket, "price": fill.fill_price, "volume": fill.volume}
@@ -157,24 +156,23 @@ class MT5BrokerManager:
         result = session.send_order(request)
         return result is not None and result.retcode == mt5.TRADE_RETCODE_DONE
 
-    def close_position(self, ticket: int) -> dict | None:
-        """
-        Legacy wrapper — delegates to OrderEngine.
-        Returns {"id", "price"} or None.
-        """
+    async def close_position(self, ticket: int) -> dict | None:
+        """Legacy async wrapper — delegates to OrderEngine. Must be awaited."""
         from core.execution.order_engine import OrderEngine
         engine = OrderEngine()
-        fill = engine.close_position(ticket)
+        fill = await engine.close_position(ticket)
         if fill is None:
             return None
         return {"id": fill.ticket, "price": fill.fill_price}
 
-    def close_all_positions(self) -> int:
+    async def close_all_positions(self) -> int:
+        """Async — close_position is now async. Must be awaited."""
         from core.execution.order_engine import OrderEngine
-        engine  = OrderEngine()
-        count   = 0
+        engine = OrderEngine()
+        count  = 0
         for pos in session.get_all_positions():
-            if engine.close_position(pos.ticket):
+            fill = await engine.close_position(pos.ticket)
+            if fill is not None:
                 count += 1
         return count
 

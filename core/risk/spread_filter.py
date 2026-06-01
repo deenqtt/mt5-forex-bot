@@ -44,13 +44,21 @@ _MAX_SPREAD_PIPS: dict[str, float] = {
 def is_spread_acceptable(symbol: str) -> bool:
     """
     Returns True if current spread ≤ configured max for this symbol.
-    Returns True (allow) if tick data is unavailable — fail open to not block
-    execution during data gaps. Caller should log if needed.
+
+    Fails CLOSED (returns False) if tick data unavailable.
+
+    Why fail closed instead of fail open:
+    - No tick = broker connection problem or market closed
+    - In either case we should NOT enter a trade
+    - "Allow on data gap" sounds safe but it means entering blind:
+      spread could be 20 pip and we'd never know
+    - The cost of missing one entry opportunity is far less than
+      entering during a 20-pip spread event
     """
     tick = session.get_tick(symbol)
     if tick is None:
-        log.warning("SpreadFilter: no tick data for %s — allowing", symbol)
-        return True
+        log.warning("SpreadFilter: no tick data for %s — BLOCKING (fail closed)", symbol)
+        return False
 
     spread_price = tick.ask - tick.bid
     if spread_price <= 0:

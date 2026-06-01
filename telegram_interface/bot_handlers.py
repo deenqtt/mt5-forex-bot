@@ -249,7 +249,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         lines  = []
         for record in positions:
             ticket = int(record["ticket"])
-            fill   = _engine.close_position(ticket)
+            fill   = await _engine.close_position(ticket)
 
             if fill is None:
                 lines.append(f"⚠️ Gagal menutup {symbol} ticket={ticket} di MT5.")
@@ -343,7 +343,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         tp       = trade_data["tp_price"]
         risk_usd = trade_data["risk_usd"]
 
-        fill = _engine.market_order(symbol, side, lot, sl=sl, tp=tp)
+        fill = await _engine.market_order(symbol, side, lot, sl=sl, tp=tp)
         if fill is None:
             await query.edit_message_text(f"❌ Order gagal {symbol}.")
             return
@@ -451,7 +451,7 @@ async def close_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     lines = []
     for record in positions:
         ticket = int(record["ticket"])
-        fill   = _engine.close_position(ticket)
+        fill   = await _engine.close_position(ticket)
 
         if fill is None:
             lines.append(
@@ -489,7 +489,7 @@ async def close_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def closeall_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("Menutup semua posisi...")
     broker = MT5BrokerManager()
-    count  = broker.close_all_positions()
+    count  = await broker.close_all_positions()
     # Reconcile cleans up position store and journals all closed trades
     from core.state.reconciler import reconcile
     reconcile()

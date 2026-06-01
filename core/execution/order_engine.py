@@ -1,32 +1,37 @@
 """
-OrderEngine — production-grade order execution.
+OrderEngine — production-grade async order execution.
 
-What this fixes vs original create_market_order():
+Changes in this version:
 
-1. Fill price: original logged ticker["last"] captured BEFORE order submission.
-   Slippage + spread + timing meant actual fill was different.
-   Fix: log result.price (actual fill) from order_send() response.
+1. market_order() and close_position() are now ASYNC.
+   Previously they used time.sleep() for retry backoff.
+   time.sleep() inside an asyncio coroutine blocks the ENTIRE event loop:
+   - tp_monitor_job cannot run during a 4-second retry window
+   - Telegram commands go unanswered while retrying
+   - Position closed by SL/TP cannot be detected during the block
 
-2. No retry: original returned None on any failure including transient requotes.
-   Fix: retry loop with per-attempt fresh price fetch, exponential backoff,
-        retryable vs fatal error distinction.
+   Fix: await asyncio.sleep() yields control back to event loop during backoff.
+   Other coroutines (monitor, handlers) can run freely between retry attempts.
 
-3. Tick fetch race: original fetched tick, then used that price in request.
-   If tick() call inside order_send() fetched a newer price, deviation check
-   could reject even valid orders.
-   Fix: fetch tick immediately before each attempt, minimize window.
+2. Per-symbol async lock added.
+   Now that market_order is async (has await points), it's possible for the
+   asyncio event loop to switch tasks between check_entry() and open_position().
+   Scenario without lock:
+     Task A: check_entry("EURUSD") → allowed
+     [event loop switches at await asyncio.sleep()]
+     Task B: check_entry("EURUSD") → allowed (A hasn't written to store yet)
+     Task A: open_position() → ticket 111
+     Task B: open_position() → ticket 222 ← duplicate!
+   Fix: per-symbol lock held from check-to-record in the caller (main.py).
+   Lock is defined here, acquired in _execute_for_symbol in main.py.
 
-4. Close race condition: original called symbol_info_tick() without None check.
-   Fix: tick fetch guarded, AttributeError impossible.
-
-5. Duplicate close guard: if close_position called twice (bug path), second call
-   finds no position in MT5 and returns None cleanly.
+3. All other logic unchanged from synchronous version.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
-import time
 from dataclasses import dataclass
 
 import MetaTrader5 as mt5
@@ -40,22 +45,30 @@ _RETRY_DELAY_S = 0.5   # base delay — multiplied by attempt number
 _MAGIC         = 234001
 _DEVIATION     = 20    # max slippage in points (~2 pip for 5-digit brokers)
 
+# Per-symbol async lock — prevents duplicate order race condition.
+# Acquired in main.py before check_entry() + order, released after open_position().
+# Only needed because market_order is now async (has await points).
+_symbol_locks: dict[str, asyncio.Lock] = {}
+
+
+def get_symbol_lock(symbol: str) -> asyncio.Lock:
+    """Return the async lock for this symbol. Creates it on first access."""
+    if symbol not in _symbol_locks:
+        _symbol_locks[symbol] = asyncio.Lock()
+    return _symbol_locks[symbol]
+
 
 @dataclass(frozen=True)
 class FillResult:
     """
-    Immutable record of actual execution. fill_price is the actual fill
-    from result.price — not an estimate from a pre-order ticker call.
-
-    Always use fill_price for:
-    - logging the actual entry price in PositionStore
-    - computing SL distance for risk verification
-    - PnL calculation baseline
+    Immutable record of actual execution.
+    fill_price is result.price from order_send() — always the actual broker fill,
+    never a pre-order price estimate.
     """
     ticket:     int
     symbol:     str
     side:       str
-    fill_price: float   # result.price — actual fill, NOT pre-order estimate
+    fill_price: float
     volume:     float
     sl:         float
     tp:         float
@@ -64,16 +77,17 @@ class FillResult:
 
 class OrderEngine:
     """
-    Stateless execution engine. Thread-safe (no shared state).
+    Stateless async execution engine.
     All instances share the same MT5Session singleton.
+    MT5 API calls are still synchronous (C DLL) but backoff is non-blocking.
     """
 
     # ── Market Order ──────────────────────────────────────────────────────
 
-    def market_order(
+    async def market_order(
         self,
         symbol:  str,
-        side:    str,              # "buy" | "sell"
+        side:    str,
         volume:  float,
         sl:      float,
         tp:      float,
@@ -81,24 +95,17 @@ class OrderEngine:
         comment: str = "forex_bot",
     ) -> FillResult | None:
         """
-        Submit market order with retry on transient failures.
-
-        Retry policy:
-        - On RETRYABLE_CODES: re-fetch price, wait _RETRY_DELAY_S × attempt, retry
-        - On FATAL_CODES: return None immediately (no point retrying)
-        - On None result (connection lost): ensure_connected() then retry
-
-        Returns FillResult with fill_price = actual execution price.
+        Submit market order. Async — backoff uses await asyncio.sleep().
+        Returns FillResult with actual fill_price on success.
         Returns None on fatal error or retry exhaustion.
         """
         order_type = mt5.ORDER_TYPE_BUY if side == "buy" else mt5.ORDER_TYPE_SELL
 
         for attempt in range(1, _MAX_RETRIES + 1):
-            # Always get fresh price immediately before submission
             tick = session.get_tick(symbol)
             if tick is None:
-                log.error("[%d/%d] Cannot fetch tick for %s", attempt, _MAX_RETRIES, symbol)
-                time.sleep(_RETRY_DELAY_S * attempt)
+                log.error("[%d/%d] No tick for %s", attempt, _MAX_RETRIES, symbol)
+                await asyncio.sleep(_RETRY_DELAY_S * attempt)
                 continue
 
             price = tick.ask if side == "buy" else tick.bid
@@ -113,7 +120,7 @@ class OrderEngine:
                 "tp":           round(float(tp), 5),
                 "deviation":    _DEVIATION,
                 "magic":        magic,
-                "comment":      comment[:31],  # MT5 truncates at 31 chars
+                "comment":      comment[:31],
                 "type_time":    mt5.ORDER_TIME_GTC,
                 "type_filling": mt5.ORDER_FILLING_IOC,
             }
@@ -121,12 +128,9 @@ class OrderEngine:
             result = session.send_order(request)
 
             if result is None:
-                log.error(
-                    "[%d/%d] send_order returned None for %s %s — connection issue",
-                    attempt, _MAX_RETRIES, side.upper(), symbol,
-                )
+                log.error("[%d/%d] send_order None for %s %s", attempt, _MAX_RETRIES, side.upper(), symbol)
                 session.ensure_connected()
-                time.sleep(_RETRY_DELAY_S * attempt)
+                await asyncio.sleep(_RETRY_DELAY_S * attempt)
                 continue
 
             if result.retcode == mt5.TRADE_RETCODE_DONE:
@@ -139,7 +143,7 @@ class OrderEngine:
                     ticket=result.order,
                     symbol=symbol,
                     side=side,
-                    fill_price=result.price,  # ← actual fill price from broker
+                    fill_price=result.price,
                     volume=result.volume,
                     sl=sl,
                     tp=tp,
@@ -148,69 +152,53 @@ class OrderEngine:
 
             if session.is_fatal(result.retcode):
                 log.error(
-                    "FATAL order error [%d] — %s %s: %s. No retry.",
+                    "FATAL order error [%d] %s %s: %s",
                     result.retcode, side.upper(), symbol, result.comment,
                 )
                 return None
 
             if session.is_retryable(result.retcode):
                 log.warning(
-                    "Retryable error [%d] attempt %d/%d — %s %s: %s",
+                    "Retryable [%d] attempt %d/%d %s %s: %s",
                     result.retcode, attempt, _MAX_RETRIES,
                     side.upper(), symbol, result.comment,
                 )
-                time.sleep(_RETRY_DELAY_S * attempt)
+                await asyncio.sleep(_RETRY_DELAY_S * attempt)
                 continue
 
-            # Unexpected retcode — log details, do not retry
-            log.error(
-                "Unexpected retcode [%d] — %s %s: %s",
-                result.retcode, side.upper(), symbol, result.comment,
-            )
+            log.error("Unexpected retcode [%d] %s %s: %s",
+                      result.retcode, side.upper(), symbol, result.comment)
             return None
 
-        log.error(
-            "ORDER EXHAUSTED %d retries: %s %s vol=%.2f",
-            _MAX_RETRIES, side.upper(), symbol, volume,
-        )
+        log.error("ORDER EXHAUSTED %d retries: %s %s", _MAX_RETRIES, side.upper(), symbol)
         return None
 
-    # ── Close Position ────────────────────────────────────────────────────
+    # ── Close Position ─────────────────────────────────────────────────────
 
-    def close_position(self, ticket: int) -> FillResult | None:
+    async def close_position(self, ticket: int) -> FillResult | None:
         """
-        Close position by MT5 ticket.
+        Close position by ticket. Async — uses await asyncio.sleep() for backoff.
 
-        Safe properties:
-        - Fetches position from MT5 first — if not found, returns None cleanly
-          (covers "already closed" case without crashing)
-        - Fetches tick inside retry loop — no stale price race
-        - Tick None-check guarded — no AttributeError on low-liquidity close
-
-        IMPORTANT: caller must only call position_store.close_position(ticket)
-        AFTER this returns a non-None FillResult. Never update local state on failure.
+        Safe: if position not found in MT5, returns None cleanly.
+        Caller must update local state ONLY after receiving non-None FillResult.
         """
         for attempt in range(1, _MAX_RETRIES + 1):
-            # Re-fetch position state each attempt — it may close between retries
             pos = session.get_position_by_ticket(ticket)
             if pos is None:
-                log.info("close_position: ticket %d not found in MT5 — already closed", ticket)
+                log.info("close_position: ticket %d not in MT5 — already closed", ticket)
                 return None
 
             close_type = (
-                mt5.ORDER_TYPE_SELL
-                if pos.type == mt5.POSITION_TYPE_BUY
+                mt5.ORDER_TYPE_SELL if pos.type == mt5.POSITION_TYPE_BUY
                 else mt5.ORDER_TYPE_BUY
             )
             close_side = "sell" if pos.type == mt5.POSITION_TYPE_BUY else "buy"
 
             tick = session.get_tick(pos.symbol)
             if tick is None:
-                log.error(
-                    "[%d/%d] Cannot fetch tick to close %s ticket=%d",
-                    attempt, _MAX_RETRIES, pos.symbol, ticket,
-                )
-                time.sleep(_RETRY_DELAY_S * attempt)
+                log.error("[%d/%d] No tick to close %s ticket=%d",
+                          attempt, _MAX_RETRIES, pos.symbol, ticket)
+                await asyncio.sleep(_RETRY_DELAY_S * attempt)
                 continue
 
             price = tick.bid if close_side == "sell" else tick.ask
@@ -233,44 +221,37 @@ class OrderEngine:
 
             if result is None:
                 session.ensure_connected()
-                time.sleep(_RETRY_DELAY_S * attempt)
+                await asyncio.sleep(_RETRY_DELAY_S * attempt)
                 continue
 
             if result.retcode == mt5.TRADE_RETCODE_DONE:
-                log.info(
-                    "CLOSED: ticket=%d %s @ %.5f",
-                    ticket, pos.symbol, result.price,
-                )
+                log.info("CLOSED: ticket=%d %s @ %.5f", ticket, pos.symbol, result.price)
                 return FillResult(
                     ticket=result.order,
                     symbol=pos.symbol,
                     side=close_side,
                     fill_price=result.price,
                     volume=result.volume,
-                    sl=0.0,
-                    tp=0.0,
+                    sl=0.0, tp=0.0,
                     retcode=result.retcode,
                 )
 
             if session.is_fatal(result.retcode):
-                log.error(
-                    "FATAL close error [%d] ticket=%d: %s",
-                    result.retcode, ticket, result.comment,
-                )
+                log.error("FATAL close [%d] ticket=%d: %s",
+                          result.retcode, ticket, result.comment)
                 return None
 
-            log.warning(
-                "Close retryable [%d] attempt %d/%d ticket=%d: %s",
-                result.retcode, attempt, _MAX_RETRIES, ticket, result.comment,
-            )
-            time.sleep(_RETRY_DELAY_S * attempt)
+            log.warning("Retryable close [%d] attempt %d/%d ticket=%d: %s",
+                        result.retcode, attempt, _MAX_RETRIES, ticket, result.comment)
+            await asyncio.sleep(_RETRY_DELAY_S * attempt)
 
-        log.error("Close exhausted %d retries: ticket=%d", _MAX_RETRIES, ticket)
+        log.error("Close exhausted retries: ticket=%d", ticket)
         return None
 
-    # ── Modify SL/TP ─────────────────────────────────────────────────────
+    # ── Modify SL/TP ──────────────────────────────────────────────────────
 
     def modify_sl_tp(self, ticket: int, sl: float, tp: float) -> bool:
+        """Synchronous — no retry needed, not a time-critical operation."""
         request = {
             "action":   mt5.TRADE_ACTION_SLTP,
             "position": ticket,
@@ -278,11 +259,8 @@ class OrderEngine:
             "tp":       round(tp, 5),
         }
         result = session.send_order(request)
-        success = result is not None and result.retcode == mt5.TRADE_RETCODE_DONE
-        if not success:
-            log.warning(
-                "modify_sl_tp failed ticket=%d: %s",
-                ticket,
-                result.comment if result else mt5.last_error(),
-            )
-        return success
+        ok = result is not None and result.retcode == mt5.TRADE_RETCODE_DONE
+        if not ok:
+            log.warning("modify_sl_tp failed ticket=%d: %s",
+                        ticket, result.comment if result else mt5.last_error())
+        return ok
