@@ -33,11 +33,10 @@ log = logging.getLogger(__name__)
 # MT5 return codes we can safely retry on (transient broker/network issues)
 RETRYABLE_CODES: frozenset[int] = frozenset({
     mt5.TRADE_RETCODE_REQUOTE,        # 10004 — price moved, retry with fresh price
-    mt5.TRADE_RETCODE_CONNECTION,     # 10006 — connection lost
-    mt5.TRADE_RETCODE_PRICE_CHANGED,  # 10015 — stale price
+    mt5.TRADE_RETCODE_CONNECTION,     # 10031 — connection lost
+    mt5.TRADE_RETCODE_PRICE_CHANGED,  # 10020 — stale price
     mt5.TRADE_RETCODE_PRICE_OFF,      # 10021 — price off quotes
-    mt5.TRADE_RETCODE_TIMEOUT,        # 10010 — request timed out
-    mt5.TRADE_RETCODE_SERVER_DISCON,  # 10033 — server disconnect
+    mt5.TRADE_RETCODE_TIMEOUT,        # 10012 — request timed out
 })
 
 # Errors that will never succeed on retry — stop immediately
@@ -47,7 +46,7 @@ FATAL_CODES: frozenset[int] = frozenset({
     mt5.TRADE_RETCODE_TRADE_DISABLED,  # 10017 — trading disabled for symbol
     mt5.TRADE_RETCODE_MARKET_CLOSED,   # 10018 — market closed
     mt5.TRADE_RETCODE_INVALID_VOLUME,  # 10014 — volume out of range
-    mt5.TRADE_RETCODE_POSITION_CLOSED, # 10009 — position already closed
+    mt5.TRADE_RETCODE_POSITION_CLOSED, # 10036 — position already closed
 })
 
 
