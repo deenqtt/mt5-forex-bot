@@ -42,6 +42,13 @@ class IndicatorManager:
         latest = df.iloc[-1]
         prev = df.iloc[-2]
 
+        # Guard: critical indicators must not be NaN.
+        # EMA-50 needs 50 candles, ADX needs ~27, RSI needs 14.
+        # If any is NaN, data is insufficient — return None so caller skips this symbol.
+        critical = ["ema_20", "ema_50", "rsi", "ADX_14", "ATRr_14"]
+        if any(pd.isna(latest.get(col)) for col in critical):
+            return None
+
         ema_20: float = float(latest["ema_20"])
         ema_50: float = float(latest["ema_50"])
 
