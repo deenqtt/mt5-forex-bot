@@ -72,6 +72,7 @@ class MT5Session:
                 obj = super().__new__(cls)
                 obj._connected  = False
                 obj._op_lock    = threading.Lock()  # guards reconnect, not data ops
+                obj._symbol_mapping = {}            # maps "EURUSD" -> "EURUSDm"
                 cls._instance   = obj
         return cls._instance
 
@@ -102,18 +103,32 @@ class MT5Session:
                 server=settings.MT5_SERVER,
             )
             if ok:
+                # Verify we are actually authorized and connected to the server
                 info = mt5.account_info()
-                self._connected = True
-                log.info(
-                    "MT5 connected: server=%s login=%d balance=%.2f",
-                    info.server if info else "?",
-                    settings.MT5_LOGIN,
-                    info.balance if info else 0,
+                term = mt5.terminal_info()
+                
+                if info is not None and term is not None and term.connected:
+                    self._connected = True
+                    log.info(
+                        "MT5 connected: server=%s login=%d balance=%.2f",
+                        info.server,
+                        settings.MT5_LOGIN,
+                        info.balance,
+                    )
+                    return True
+                
+                code, msg = mt5.last_error()
+                log.warning(
+                    "MT5 init OK but session not ready (attempt %d): info=%s, connected=%s, error=[%d] %s",
+                    attempt + 1, "OK" if info else "None", 
+                    term.connected if term else "None",
+                    code, msg
                 )
-                return True
-
-            code, msg = mt5.last_error()
-            log.error("MT5 init failed (attempt %d): [%d] %s", attempt + 1, code, msg)
+                # If we are here, initialize succeeded but we are not yet connected/authorized.
+                # We'll try again or let the loop continue.
+            else:
+                code, msg = mt5.last_error()
+                log.error("MT5 init failed (attempt %d): [%d] %s", attempt + 1, code, msg)
 
         self._connected = False
         return False
@@ -127,7 +142,7 @@ class MT5Session:
         if self._connected and self._ping():
             return True
 
-        log.warning("MT5 health check failed — attempting reconnect")
+        log.warning("MT5 health check failed (disconnected) — attempting reconnect")
         with self._op_lock:
             # Re-check after acquiring lock — another thread may have reconnected
             if self._connected and self._ping():
@@ -136,8 +151,53 @@ class MT5Session:
             return self._do_connect()
 
     def _ping(self) -> bool:
-        """Fast health check — account_info() is the lightest MT5 call."""
-        return mt5.account_info() is not None
+        """
+        Health check — verify terminal is initialized AND connected to server.
+        account_info() alone can return cached data even if disconnected.
+        """
+        info = mt5.account_info()
+        if info is None:
+            return False
+        
+        term = mt5.terminal_info()
+        if term is None or not term.connected:
+            return False
+            
+        return True
+
+    def _ensure_symbol(self, symbol: str) -> str | None:
+        """
+        Ensure symbol is visible in Market Watch. 
+        Case-insensitive and automatically tries suffixes.
+        """
+        sym_upper = symbol.upper()
+        if sym_upper in self._symbol_mapping:
+            return self._symbol_mapping[sym_upper]
+
+        # 1. Try variations of the base name
+        for name in [sym_upper, symbol.lower(), symbol]:
+            info = mt5.symbol_info(name)
+            if info is not None:
+                if not info.visible:
+                    mt5.symbol_select(name, True)
+                self._symbol_mapping[sym_upper] = name
+                return name
+
+        # 2. Try common suffixes (both upper and lower)
+        suffixes = ["m", "M", ".k", ".i", ".x", "r", "v"]
+        for sfx in suffixes:
+            for base in [sym_upper, symbol.lower()]:
+                alt_name = f"{base}{sfx}"
+                info = mt5.symbol_info(alt_name)
+                if info is not None:
+                    log.info("Detected symbol: %s -> %s", symbol, alt_name)
+                    if not info.visible:
+                        mt5.symbol_select(alt_name, True)
+                    self._symbol_mapping[sym_upper] = alt_name
+                    return alt_name
+
+        log.error("Symbol %s not found in any variation.", symbol)
+        return None
 
     def shutdown(self) -> None:
         """
@@ -156,24 +216,50 @@ class MT5Session:
         """Returns mt5.Tick or None. Logs on failure."""
         if not self.ensure_connected():
             return None
-        tick = mt5.symbol_info_tick(symbol)
+        
+        real_symbol = self._ensure_symbol(symbol)
+        if not real_symbol:
+            return None
+
+        tick = mt5.symbol_info_tick(real_symbol)
         if tick is None:
             code, msg = mt5.last_error()
-            log.warning("get_tick(%s) failed: [%d] %s", symbol, code, msg)
+            log.warning("get_tick(%s) failed: [%d] %s", real_symbol, code, msg)
         return tick
 
     def get_symbol_info(self, symbol: str) -> Any | None:
         if not self.ensure_connected():
             return None
-        return mt5.symbol_info(symbol)
+        
+        real_symbol = self._ensure_symbol(symbol)
+        if not real_symbol:
+            return None
+
+        return mt5.symbol_info(real_symbol)
+
+    def get_tick_info(self, symbol: str) -> tuple[float, float] | None:
+        """
+        Returns (trade_tick_value, trade_tick_size) for the symbol.
+        Used for accurate lot sizing across different asset classes (Forex, Crypto, Gold).
+        """
+        info = self.get_symbol_info(symbol)
+        if info is None:
+            return None
+        
+        return float(info.trade_tick_value), float(info.trade_tick_size)
 
     def get_rates(self, symbol: str, timeframe: int, count: int) -> Any | None:
         if not self.ensure_connected():
             return None
-        rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, count)
+        
+        real_symbol = self._ensure_symbol(symbol)
+        if not real_symbol:
+            return None
+
+        rates = mt5.copy_rates_from_pos(real_symbol, timeframe, 0, count)
         if rates is None:
             code, msg = mt5.last_error()
-            log.warning("get_rates(%s) failed: [%d] %s", symbol, code, msg)
+            log.warning("get_rates(%s) failed: [%d] %s", real_symbol, code, msg)
         return rates
 
     # ── Account ───────────────────────────────────────────────────────────
@@ -200,7 +286,10 @@ class MT5Session:
     def get_positions_by_symbol(self, symbol: str) -> list:
         if not self.ensure_connected():
             return []
-        pos = mt5.positions_get(symbol=symbol)
+        real_symbol = self._ensure_symbol(symbol)
+        if not real_symbol:
+            return []
+        pos = mt5.positions_get(symbol=real_symbol)
         return list(pos) if pos else []
 
     # ── Orders ────────────────────────────────────────────────────────────
@@ -208,7 +297,14 @@ class MT5Session:
     def get_pending_orders(self, symbol: str | None = None) -> list:
         if not self.ensure_connected():
             return []
-        orders = mt5.orders_get(symbol=symbol) if symbol else mt5.orders_get()
+        
+        real_symbol = None
+        if symbol:
+            real_symbol = self._ensure_symbol(symbol)
+            if not real_symbol:
+                return []
+                
+        orders = mt5.orders_get(symbol=real_symbol) if real_symbol else mt5.orders_get()
         return list(orders) if orders else []
 
     def send_order(self, request: dict) -> Any | None:
@@ -218,6 +314,13 @@ class MT5Session:
         """
         if not self.ensure_connected():
             return None
+        
+        # If request contains a symbol, ensure it's mapped correctly
+        if "symbol" in request:
+            real_symbol = self._ensure_symbol(request["symbol"])
+            if real_symbol:
+                request["symbol"] = real_symbol
+                
         return mt5.order_send(request)
 
     # ── History ───────────────────────────────────────────────────────────
@@ -253,11 +356,16 @@ class MT5Session:
         """
         if not self.ensure_connected():
             return None
-        result = mt5.order_calc_profit(action, symbol, volume, open_price, close_price)
+        
+        real_symbol = self._ensure_symbol(symbol)
+        if not real_symbol:
+            return None
+
+        result = mt5.order_calc_profit(action, real_symbol, volume, open_price, close_price)
         if result is None:
             log.warning(
                 "calc_profit failed: %s %s vol=%.2f %.5f→%.5f err=%s",
-                symbol, "BUY" if action == mt5.ORDER_TYPE_BUY else "SELL",
+                real_symbol, "BUY" if action == mt5.ORDER_TYPE_BUY else "SELL",
                 volume, open_price, close_price, mt5.last_error(),
             )
         return result

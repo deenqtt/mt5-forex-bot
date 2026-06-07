@@ -164,6 +164,8 @@ async def auto_trading_job(context) -> None:
     chat_id  = settings.TELEGRAM_CHAT_ID
 
     for symbol in _get_scan_symbols(context, broker):
+        if not is_valid_session(symbol):
+            continue
         try:
             df = broker.fetch_ohlcv(symbol)
             if df.empty:
@@ -259,6 +261,8 @@ async def auto_execute_job(context) -> None:
         return
 
     for symbol in _get_scan_symbols(context, broker):
+        if not is_valid_session(symbol):
+            continue
         try:
             await _execute_for_symbol(
                 symbol, context, broker, ml_model, analyzer, engine, chat_id
@@ -360,6 +364,15 @@ async def _execute_for_symbol_locked(
     gate = check_entry(symbol, risk_usd, sl=sl_price, tp=tp_price)
     if not gate.allowed:
         log.info("ExposureGate rejected %s: %s", symbol, gate.reason)
+        # Notify user why it was skipped
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"⚠️  SKIPPED — {side.upper()} {symbol}\n\n"
+                f"Sinyal valid, tapi dibatalkan karena:\n"
+                f"• {gate.reason}"
+            ),
+        )
         return
 
     # Execute order — async retry, does not block event loop during backoff
@@ -553,6 +566,7 @@ if __name__ == "__main__":
     application.add_handler(CommandHandler("balance",       bot_handlers.balance))
     application.add_handler(CommandHandler("analyze",       bot_handlers.analyze_command))
     application.add_handler(CommandHandler("status",        bot_handlers.status_command))
+    application.add_handler(CommandHandler("sync",          bot_handlers.sync_command))
     application.add_handler(CommandHandler("close",         bot_handlers.close_command))
     application.add_handler(CommandHandler("closeall",      bot_handlers.closeall_command))
     application.add_handler(CommandHandler("train",         bot_handlers.train_command))

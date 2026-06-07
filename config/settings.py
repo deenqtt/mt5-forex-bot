@@ -15,6 +15,10 @@ TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 # Gemini AI (optional)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
+# Currency Handling
+ACCOUNT_CURRENCY = "IDR"  # Set to "USD" if your account is in USD
+IDR_TO_USD_RATE  = 16200.0 # Approximate rate for risk calculation
+
 # Risk Management
 DEFAULT_RISK_PERCENT  = 0.01    # 1% equity per trade
 DEFAULT_SL_PIPS       = 50      # pips
@@ -66,7 +70,7 @@ WEEKEND_CLOSE_HOUR_UTC    = 14
 WEEKEND_CLOSE_MINUTE_UTC  = 0
 
 # Reconciler periodic interval (seconds)
-RECONCILE_INTERVAL = 300    # every 5 minutes
+RECONCILE_INTERVAL = 60    # every 1 minute
 
 # ML
 ML_MODEL_PATH               = "data/ml_model.joblib"

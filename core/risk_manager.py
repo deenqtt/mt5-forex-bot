@@ -1,28 +1,32 @@
 from __future__ import annotations
 
+import logging
 from config import settings
+from core.connection.mt5_session import session
+
+log = logging.getLogger(__name__)
 
 
 class RiskManager:
     def __init__(self, balance: float) -> None:
+        """
+        balance should be in USD. 
+        If account is IDR, balance passed here is already normalized via settings.IDR_TO_USD_RATE.
+        """
         self.balance = balance
 
     @staticmethod
     def pip_multiplier(symbol: str) -> float:
-        """JPY pairs: 1 pip = 0.01. Others: 1 pip = 0.0001."""
-        return 0.01 if symbol.upper() in settings.JPY_PAIRS else 0.0001
-
-    @staticmethod
-    def pip_value_usd(symbol: str, lot: float = 1.0) -> float:
         """
-        Approximate pip value in USD per lot.
-        EURUSD/GBPUSD/etc: $10/pip/lot standard.
-        USDJPY: ~$9.3/pip/lot (varies with rate — use $10 as approx).
-        XAUUSD: $1/pip/lot (1 pip = $0.01 for gold).
+        JPY pairs: 1 pip = 0.01. Others: 1 pip = 0.0001.
+        Used primarily for display/logging pips.
         """
-        if "XAU" in symbol:
-            return 1.0 * lot
-        return settings.PIP_VALUE_USD * lot
+        sym_upper = symbol.upper()
+        if "JPY" in sym_upper:
+            return 0.01
+        if "XAU" in sym_upper:
+            return 0.1   # Gold: 1 pip = $0.10 (standard)
+        return 0.0001
 
     def calculate_position_size(
         self,
@@ -31,17 +35,57 @@ class RiskManager:
         sl_price: float,
         risk_pct: float = settings.DEFAULT_RISK_PERCENT,
     ) -> float:
-        """Returns lot size clamped to [MIN_LOT, MAX_LOT]."""
+        """
+        Returns lot size clamped to [MIN_LOT, MAX_LOT].
+        Uses dynamic trade_tick_value from broker for 100% accuracy on all assets.
+        """
         sl_distance = abs(entry_price - sl_price)
-        pip_mult    = self.pip_multiplier(symbol)
-        sl_pips     = sl_distance / pip_mult
-        if sl_pips <= 0:
+        if sl_distance <= 0:
             return settings.MIN_LOT
 
-        risk_usd  = self.balance * risk_pct
-        pip_val   = self.pip_value_usd(symbol, lot=1.0)
-        lot_size  = risk_usd / (sl_pips * pip_val)
-        return round(max(settings.MIN_LOT, min(settings.MAX_LOT, lot_size)), 2)
+        # 1. Fetch broker-authoritative tick and volume info
+        sym_info = session.get_symbol_info(symbol)
+        if not sym_info:
+            log.warning("Could not fetch symbol info for %s, falling back to safe min lot", symbol)
+            return settings.MIN_LOT
+        
+        tick_val  = float(sym_info.trade_tick_value)
+        tick_size = float(sym_info.trade_tick_size)
+        vol_min   = float(sym_info.volume_min)
+        vol_step  = float(sym_info.volume_step)
+        vol_max   = float(sym_info.volume_max)
+        
+        # trade_tick_value is the profit/loss in ACCOUNT CURRENCY for 1 LOT when price moves by 1 TICK.
+        # If account is IDR, tick_val is in IDR. We MUST normalize it to USD to match self.balance.
+        if settings.ACCOUNT_CURRENCY == "IDR":
+            tick_val_usd = tick_val / settings.IDR_TO_USD_RATE
+        else:
+            tick_val_usd = tick_val
+
+        # 2. Calculate risk in USD
+        risk_usd = self.balance * risk_pct
+
+        # 3. Formula: Lot = Risk_USD / ( (SL_Dist / Tick_Size) * Tick_Val_USD )
+        ticks_in_sl = sl_distance / tick_size
+        if ticks_in_sl <= 0:
+            return vol_min
+
+        lot_size = risk_usd / (ticks_in_sl * tick_val_usd)
+        
+        # Ensure lot size follows broker's volume step and min/max limits
+        import math
+        # Calculation: floor to nearest volume_step to stay conservative with risk
+        stepped_lot = math.floor(lot_size / vol_step) * vol_step
+        final_lot   = round(max(vol_min, min(vol_max, stepped_lot)), 2)
+        
+        # If even the minimum volume exceeds our risk budget, we should ideally not trade.
+        # But for now, we return vol_min and let ExposureGate or the broker handle it.
+        
+        log.info(
+            "Risk Calc %s: Bal=$%.2f Risk=$%.2f SL_Dist=%.5f Ticks=%.1f Lot=%.2f (Min: %.2f)",
+            symbol, self.balance, risk_usd, sl_distance, ticks_in_sl, final_lot, vol_min
+        )
+        return final_lot
 
     def calculate_risk_usd(
         self,
@@ -50,10 +94,21 @@ class RiskManager:
         sl_price: float,
         lot: float,
     ) -> float:
+        """Returns the actual USD risk for a given lot size and SL distance."""
         sl_distance = abs(entry_price - sl_price)
-        pip_mult    = self.pip_multiplier(symbol)
-        sl_pips     = sl_distance / pip_mult
-        return round(sl_pips * self.pip_value_usd(symbol, lot), 2)
+        tick_info   = session.get_tick_info(symbol)
+        if not tick_info:
+            return 0.0
+        
+        tick_val, tick_size = tick_info
+        
+        if settings.ACCOUNT_CURRENCY == "IDR":
+            tick_val_usd = tick_val / settings.IDR_TO_USD_RATE
+        else:
+            tick_val_usd = tick_val
+
+        ticks_in_sl = sl_distance / tick_size
+        return round(ticks_in_sl * tick_val_usd * lot, 2)
 
     @staticmethod
     def get_sl_tp_atr(

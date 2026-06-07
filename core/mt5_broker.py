@@ -87,11 +87,26 @@ class MT5BrokerManager:
 
     def get_balance(self) -> float:
         info = session.get_account_info()
-        return float(info.balance) if info else 0.0
+        if not info:
+            return 0.0
+        
+        raw_bal = float(info.balance)
+        if settings.ACCOUNT_CURRENCY == "IDR":
+            normalized = raw_bal / settings.IDR_TO_USD_RATE
+            log.debug("IDR Balance normalized: %.2f -> $%.2f", raw_bal, normalized)
+            return normalized
+        return raw_bal
 
     def get_equity(self) -> float:
         info = session.get_account_info()
-        return float(info.equity) if info else 0.0
+        if not info:
+            return 0.0
+            
+        raw_eq = float(info.equity)
+        if settings.ACCOUNT_CURRENCY == "IDR":
+            normalized = raw_eq / settings.IDR_TO_USD_RATE
+            return normalized
+        return raw_eq
 
     # ── Positions ─────────────────────────────────────────────────────────
 

@@ -37,6 +37,7 @@ from config import settings
 from core.execution.order_engine import OrderEngine
 from core.mt5_broker import MT5BrokerManager
 from core.risk.circuit_breaker import circuit_breaker
+from core.risk.session_filter import is_valid_session
 from core.risk_manager import RiskManager
 from core.state.position_store import (
     get_all_positions,
@@ -147,6 +148,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "🤖 Forex Bot MT5 Aktif\n\n"
         "/analyze [SYMBOL]     — Analisa + tombol eksekusi\n"
         "/status               — Posisi terbuka + circuit breaker\n"
+        "/sync                 — Sinkronisasi paksa dengan MT5\n"
         "/close [SYMBOL]       — Tutup posisi manual\n"
         "/closeall             — Tutup SEMUA posisi\n"
         "/balance              — Cek saldo\n"
@@ -159,6 +161,28 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "── Laporan ──\n"
         "/report               — Performance summary\n"
     )
+
+
+@authorized_only
+async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Manually trigger reconciliation."""
+    await update.message.reply_text("Memulai sinkronisasi paksa...")
+    from core.state.reconciler import reconcile
+    summary = reconcile()
+    
+    text = (
+        f"🔄 Sinkronisasi Selesai:\n"
+        f"• Cocok    : {summary['matched']}\n"
+        f"• Ditutup  : {summary['closed']}\n"
+        f"• Orphan   : {summary['orphans']}\n"
+        f"• Error    : {summary['errors']}"
+    )
+    if summary["closed"] > 0 or summary["orphans"] > 0:
+        text += "\n\n⚠️ State telah diperbarui untuk mencocokkan MT5."
+    else:
+        text += "\n\n✅ State sudah sesuai dengan MT5."
+        
+    await update.message.reply_text(text)
 
 
 @authorized_only
@@ -178,21 +202,41 @@ async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text("Contoh: /analyze EURUSD")
         return
 
-    symbol = context.args[0].upper()
-    await update.message.reply_text(f"Menganalisa {symbol}...")
-
-    broker = MT5BrokerManager()
-    df     = broker.fetch_ohlcv(symbol, "1h", 100)
-    if df.empty:
-        await update.message.reply_text(f"Gagal ambil data {symbol}")
+    symbol_input = context.args[0]
+    
+    # Check if market is open before analyzing
+    if not is_valid_session(symbol_input):
+        await update.message.reply_text(
+            f"⛔ Market {symbol_input.upper()} sedang tutup atau libur. "
+            "Analisa hanya tersedia saat market aktif."
+        )
         return
 
-    df_4h   = broker.fetch_ohlcv(symbol, "4h", 60)
+    await update.message.reply_text(f"Menganalisa {symbol_input.upper()}...")
+
+    broker = MT5BrokerManager()
+    df     = broker.fetch_ohlcv(symbol_input, "1h", 100)
+    
+    if df.empty:
+        # Check if the connection is actually alive
+        from core.connection.mt5_session import session
+        if not session.ensure_connected():
+            await update.message.reply_text("❌ Terputus dari MT5. Cek koneksi terminal.")
+        else:
+            await update.message.reply_text(f"❓ Simbol {symbol_input.upper()} tidak ditemukan atau tidak ada data.")
+        return
+
+    # Use the first timestamp to confirm we got data
+    df_4h   = broker.fetch_ohlcv(symbol_input, "4h", 60)
     df      = IndicatorManager.add_indicators(df)
     signals = IndicatorManager.get_latest_signals(df)
     if signals is None:
-        await update.message.reply_text(f"Data {symbol} tidak cukup.")
+        await update.message.reply_text(f"Data {symbol_input.upper()} tidak cukup.")
         return
+
+    # Get the mapped symbol name (e.g. EURUSDm) for internal logic
+    from core.connection.mt5_session import session
+    real_symbol = session._ensure_symbol(symbol_input) or symbol_input
 
     htf = {"bias": "neutral", "regime": "unknown", "adx": 0.0, "ema_trend": "ranging", "dmp": 0, "dmn": 0}
     if not df_4h.empty:
@@ -200,7 +244,7 @@ async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         htf   = IndicatorManager.get_htf_bias(df_4h)
 
     prediction    = _ml_model.predict(df)
-    analysis_text = _analyzer.analyze(symbol, signals, prediction)
+    analysis_text = _analyzer.analyze(real_symbol, signals, prediction)
 
     bias_emoji = {"bullish": "🟢", "bearish": "🔴", "neutral": "⚪"}.get(htf["bias"], "⚪")
     analysis_text += "\n" + "\n".join([
@@ -212,12 +256,12 @@ async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     ])
 
     if signals.get("atr", 0) > 0:
-        context.user_data[f"atr_{symbol}"] = signals["atr"]
-    context.user_data[f"htf_{symbol}"] = htf["bias"]
+        context.user_data[f"atr_{real_symbol}"] = signals["atr"]
+    context.user_data[f"htf_{real_symbol}"] = htf["bias"]
 
-    has_pos = has_open_position(symbol)
+    has_pos = has_open_position(real_symbol)
     await update.message.reply_text(
-        analysis_text, reply_markup=_build_action_keyboard(symbol, has_pos)
+        analysis_text, reply_markup=_build_action_keyboard(real_symbol, has_pos)
     )
 
 
@@ -416,7 +460,13 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     else:
         lines.append(f"\n📈 Posisi Terbuka ({len(mt5_positions)}):")
         for p in mt5_positions:
-            pnl  = float(p["unrealizedPnl"])
+            raw_pnl = float(p["unrealizedPnl"])
+            # Normalize unrealized PnL to USD if account is IDR
+            if settings.ACCOUNT_CURRENCY == "IDR":
+                pnl = raw_pnl / settings.IDR_TO_USD_RATE
+            else:
+                pnl = raw_pnl
+                
             sign = "+" if pnl >= 0 else ""
             local = local_store.get(str(p["ticket"]), {})
             risk  = local.get("risk_usd", "?")

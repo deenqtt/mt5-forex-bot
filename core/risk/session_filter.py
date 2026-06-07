@@ -18,20 +18,36 @@ All times are UTC.
 
 from __future__ import annotations
 
+import MetaTrader5 as mt5
 from datetime import datetime, timezone
+from core.connection.mt5_session import session
 
 
 def is_valid_session(symbol: str) -> bool:
     """
     Returns True if current UTC time is within acceptable trading hours
-    for the given symbol.
-    Returns True for unrecognized symbols (fail open).
+    AND the broker explicitly reports the symbol as open for trading.
     """
+    # 1. Check Broker Trade Mode (Authoritative)
+    info = session.get_symbol_info(symbol)
+    if info is not None:
+        # trade_mode 0 = Disabled, 4 = Full access (Buy/Sell allowed)
+        # We only want to scan/trade if full access is enabled
+        if info.trade_mode != mt5.SYMBOL_TRADE_MODE_FULL:
+            return False
+
+    # 2. Heuristic Session Filters (Time-based)
     now     = datetime.now(timezone.utc)
     weekday = now.weekday()  # 0=Mon, 4=Fri, 5=Sat, 6=Sun
     hour    = now.hour
 
-    # Weekend: market closed
+    # Crypto Exemption: BTC, XRP, ETH, LTC, etc usually trade 24/7
+    # If the broker says it's OPEN (trade_mode=4 above), we allow it.
+    crypto_keywords = ("BTC", "XRP", "ETH", "LTC", "SOL", "ADA", "DOGE")
+    if any(k in symbol.upper() for k in crypto_keywords):
+        return True
+
+    # Weekend: market closed (For Forex/Gold)
     if weekday == 5:   # Saturday — always closed
         return False
     if weekday == 6 and hour < 21:  # Sunday until ~21:00 UTC (market opens)

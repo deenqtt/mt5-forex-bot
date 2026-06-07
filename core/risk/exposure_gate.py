@@ -102,7 +102,7 @@ def check_entry(symbol: str, risk_usd: float, sl: float = 0.0, tp: float = 0.0) 
     if open_count >= MAX_OPEN_POSITIONS:
         return GateResult(
             False,
-            f"Max positions reached ({open_count}/{MAX_OPEN_POSITIONS})",
+            f"Jumlah posisi maksimal tercapai ({open_count}/{MAX_OPEN_POSITIONS}).",
         )
 
     # ── Layer 3: Total risk % of equity ──────────────────────────────────
@@ -110,14 +110,14 @@ def check_entry(symbol: str, risk_usd: float, sl: float = 0.0, tp: float = 0.0) 
     if account:
         equity     = float(account.equity)
         if equity <= 0:
-            return GateResult(False, "Equity is zero or negative — cannot trade")
+            return GateResult(False, "Equity nol atau negatif.")
 
         total_risk = get_total_risk_usd() + risk_usd
         risk_pct   = (total_risk / equity) * 100
         if risk_pct > MAX_TOTAL_RISK_PCT:
             return GateResult(
                 False,
-                f"Total risk {risk_pct:.1f}% would exceed cap {MAX_TOTAL_RISK_PCT}%",
+                f"Total risiko {risk_pct:.1f}% melampaui batas {MAX_TOTAL_RISK_PCT}%.",
             )
 
     # ── Layer 4: Correlation group cap ───────────────────────────────────
@@ -130,7 +130,7 @@ def check_entry(symbol: str, risk_usd: float, sl: float = 0.0, tp: float = 0.0) 
         if len(overlap) >= MAX_CORRELATED:
             return GateResult(
                 False,
-                f"Correlation limit: {symbol} overlaps with open {sorted(overlap)}",
+                f"Limit korelasi: {symbol} searah dengan {sorted(overlap)}.",
             )
 
     # ── Layer 5: Margin level protection ─────────────────────────────────
@@ -140,8 +140,7 @@ def check_entry(symbol: str, risk_usd: float, sl: float = 0.0, tp: float = 0.0) 
         if margin_level < MIN_MARGIN_LEVEL:
             return GateResult(
                 False,
-                f"Margin level {margin_level:.0f}% < minimum {MIN_MARGIN_LEVEL:.0f}% "
-                f"(Exness margin call ~100%). Risk: opening position could trigger call.",
+                f"Margin level terlalu rendah ({margin_level:.0f}% < {MIN_MARGIN_LEVEL:.0f}%).",
             )
 
     # ── Layer 6: Broker stop level validation ────────────────────────────

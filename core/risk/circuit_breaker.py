@@ -56,25 +56,21 @@ class CircuitBreaker:
         Call once at startup. Records equity baseline for drawdown tracking.
         If called again (restart), resets the baseline.
         """
-        account = session.get_account_info()
-        if account:
-            self._session_equity = float(account.equity)
+        from core.mt5_broker import MT5BrokerManager
+        broker = MT5BrokerManager()
+        equity = broker.get_equity()
+        if equity > 0:
+            self._session_equity = equity
             log.info(
                 "CircuitBreaker: session baseline equity = $%.2f",
                 self._session_equity,
             )
         else:
-            log.warning("CircuitBreaker: cannot get account info at startup")
+            log.warning("CircuitBreaker: cannot get account info or equity is 0 at startup")
 
     def check(self) -> tuple[bool, str]:
         """
         Returns (allowed, reason).
-        allowed=False → halt auto-execution for this cycle.
-
-        Note: allowed=False does NOT disable the bot permanently.
-        It only skips execution in the current job cycle.
-        The condition is re-evaluated next cycle (every 60s).
-        To permanently stop, set context.bot_data["auto_exec_active"] = False.
         """
         stats = get_daily_stats()
 
@@ -94,23 +90,25 @@ class CircuitBreaker:
 
         # Layer 3: Session equity drawdown
         if self._session_equity and self._session_equity > 0:
-            account = session.get_account_info()
-            if account:
-                equity = float(account.equity)
-                dd_pct = (self._session_equity - equity) / self._session_equity * 100
-                if dd_pct >= _EQUITY_DD_PCT:
-                    return False, (
-                        f"Equity drawdown {dd_pct:.1f}% ≥ limit {_EQUITY_DD_PCT}%  "
-                        f"(start=${self._session_equity:.2f}  now=${equity:.2f})"
-                    )
+            from core.mt5_broker import MT5BrokerManager
+            broker = MT5BrokerManager()
+            equity = broker.get_equity()
+            dd_pct = (self._session_equity - equity) / self._session_equity * 100
+            if dd_pct >= _EQUITY_DD_PCT:
+                return False, (
+                    f"Equity drawdown {dd_pct:.1f}% ≥ limit {_EQUITY_DD_PCT}%  "
+                    f"(start=${self._session_equity:.2f}  now=${equity:.2f})"
+                )
 
         return True, "ok"
 
     def status(self) -> dict:
         """For /status command display."""
         stats   = get_daily_stats()
-        account = session.get_account_info()
-        equity  = float(account.equity) if account else 0.0
+        from core.mt5_broker import MT5BrokerManager
+        broker  = MT5BrokerManager()
+        equity  = broker.get_equity()
+        
         dd_pct  = 0.0
         if self._session_equity and self._session_equity > 0:
             dd_pct = (self._session_equity - equity) / self._session_equity * 100

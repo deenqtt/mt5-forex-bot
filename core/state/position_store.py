@@ -76,7 +76,9 @@ def _save(data: dict) -> None:
         json.dump(data, f, indent=2, default=str)
         f.flush()
         os.fsync(f.fileno())  # ensure kernel buffer → disk before rename
-    _TMP_FILE.rename(_POSITIONS_FILE)
+    
+    # Use os.replace instead of rename on Windows to avoid FileExistsError
+    os.replace(_TMP_FILE, _POSITIONS_FILE)
 
 
 # ── Public API ────────────────────────────────────────────────────────────
