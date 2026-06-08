@@ -152,6 +152,8 @@ async def auto_trading_job(context) -> None:
     """Scan symbols and send analysis alerts — no order execution."""
     if not context.bot_data.get("auto_mode_active", False):
         return
+    if context.bot_data.get("auto_exec_active", False):
+        return  # auto_execute_job covers same scan — avoid double MT5 calls
 
     from strategy.indicators import IndicatorManager
     from strategy.ml_model import MLModel
@@ -195,6 +197,11 @@ async def auto_trading_job(context) -> None:
             if time.time() - scan_alerts.get(symbol, 0) < 4 * 3600:
                 continue
             scan_alerts[symbol] = time.time()
+            save_bot_state(
+                auto_scan=True,
+                auto_exec=context.bot_data.get("auto_exec_active", False),
+                scan_alerted=scan_alerts,
+            )
 
             prediction = ml_model.predict(df)
             analysis   = analyzer.analyze(symbol, signals, prediction)
@@ -339,8 +346,16 @@ async def _execute_for_symbol_locked(
 
     side = "buy" if composite > 0 else "sell"
 
+    # ML gate: skip if trained model confident in opposite direction
+    prediction = ml_model.predict(df)
+    if prediction == "bearish" and side == "buy":
+        log.info("ML gate: skip BUY %s — model predicts bearish", symbol)
+        return
+    if prediction == "bullish" and side == "sell":
+        log.info("ML gate: skip SELL %s — model predicts bullish", symbol)
+        return
+
     # Calculate SL/TP using current price estimate for sizing
-    # Actual fill price will be captured from order result
     tick = session.get_tick(symbol)
     if tick is None:
         return
@@ -375,6 +390,17 @@ async def _execute_for_symbol_locked(
         )
         return
 
+    # Fresh tick just before execution — recalculate SL/TP to avoid stale anchor price
+    tick_fresh = session.get_tick(symbol)
+    if tick_fresh is None:
+        return
+    entry_price = tick_fresh.ask if side == "buy" else tick_fresh.bid
+    sl_price, tp_price = (
+        RM.get_sl_tp_atr(entry_price, atr, side)
+        if atr > 0
+        else RM.get_sl_tp_pips(symbol, entry_price, side)
+    )
+
     # Execute order — async retry, does not block event loop during backoff
     fill = await engine.market_order(symbol, side, lot_size, sl=sl_price, tp=tp_price)
     if fill is None:
@@ -398,8 +424,7 @@ async def _execute_for_symbol_locked(
         equity_at_open=equity,
     )
 
-    # Notification
-    prediction = ml_model.predict(df)
+    # Notification — prediction already computed above (ML gate)
     analysis   = analyzer.analyze(symbol, signals, prediction)
     from core.risk_manager import RiskManager as RM2
     pip_mult   = RM2.pip_multiplier(symbol)
@@ -506,6 +531,31 @@ async def auto_off(update, context) -> None:
     await update.message.reply_text("🛑 Auto Scan DIMATIKAN.")
 
 
+async def restore_state_job(context) -> None:
+    """
+    Runs once at startup (first=5s) to restore persisted bot state.
+    context.bot_data is only accessible inside jobs/handlers, not __main__.
+    """
+    state = load_bot_state()
+    context.bot_data["auto_mode_active"] = state["auto_scan"]
+    context.bot_data["auto_exec_active"] = state["auto_exec"]
+    context.bot_data["scan_alerted"]     = state.get("scan_alerted", {})
+    log.info(
+        "State restored: auto_scan=%s auto_exec=%s scan_alerted_count=%d",
+        state["auto_scan"], state["auto_exec"], len(state.get("scan_alerted", {})),
+    )
+    if state.get("stopped_by_cb") and state.get("cb_reason"):
+        await context.bot.send_message(
+            chat_id=settings.TELEGRAM_CHAT_ID,
+            text=(
+                f"⚠️ Restart terdeteksi.\n"
+                f"Auto Execute sebelumnya dihentikan circuit breaker:\n\n"
+                f"{state['cb_reason']}\n\n"
+                f"Gunakan /auto_exec_on untuk aktifkan kembali setelah evaluasi."
+            ),
+        )
+
+
 def _should_weekend_close_now() -> bool:
     """
     True if it's Friday AFTER the close hour (handles restart edge case).
@@ -579,6 +629,7 @@ if __name__ == "__main__":
 
     # Register recurring jobs
     jq = application.job_queue
+    jq.run_once(restore_state_job,                                     when=5)
     jq.run_repeating(tp_monitor_job,   interval=TP_MONITOR_INTERVAL,  first=15)
     jq.run_repeating(reconcile_job,    interval=RECONCILE_INTERVAL,   first=60)
     jq.run_repeating(auto_trading_job, interval=AUTO_SCAN_INTERVAL,   first=10)

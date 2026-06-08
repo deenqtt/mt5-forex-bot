@@ -45,6 +45,7 @@ def save_bot_state(
     auto_exec: bool,
     stopped_by_circuit_breaker: bool = False,
     circuit_breaker_reason: str = "",
+    scan_alerted: dict | None = None,
 ) -> None:
     _STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -52,6 +53,7 @@ def save_bot_state(
         "auto_exec":               auto_exec,
         "stopped_by_cb":           stopped_by_circuit_breaker,
         "cb_reason":               circuit_breaker_reason,
+        "scan_alerted":            scan_alerted or {},
         "saved_at":                datetime.utcnow().isoformat(),
     }
     try:
@@ -70,6 +72,7 @@ def load_bot_state() -> dict:
         "auto_exec": False,
         "stopped_by_cb": False,
         "cb_reason": "",
+        "scan_alerted": {},
         "saved_at": "",
     }
     if not _STATE_FILE.exists():

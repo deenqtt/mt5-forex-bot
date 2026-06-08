@@ -62,7 +62,7 @@ def is_valid_session(symbol: str) -> bool:
 
     if "JPY" in symbol:
         # Tokyo: 00:00–09:00, London: 07:00–16:00
-        return hour < 9 or 7 <= hour < 16
+        return hour < 16
 
     if "XAU" in symbol:
         # Gold most liquid during London + NY: 07:00–21:00

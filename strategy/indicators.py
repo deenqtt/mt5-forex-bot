@@ -93,7 +93,7 @@ class IndicatorManager:
         prev_adx: float = float(prev.get("ADX_14", 0.0))
         adx_rising: bool = adx_val > prev_adx
 
-        if adx_val >= settings.ADX_TRENDING_THRESHOLD and adx_rising:
+        if adx_val >= settings.ADX_TRENDING_THRESHOLD:
             regime = "trending"
         elif adx_val >= settings.ADX_RANGING_THRESHOLD:
             regime = "transition"
@@ -153,7 +153,7 @@ class IndicatorManager:
         ema_50 = float(latest.get("ema_50", 0.0))
         ema_trend = "bullish" if ema_20 > ema_50 else ("bearish" if ema_20 < ema_50 else "ranging")
 
-        if adx >= settings.ADX_TRENDING_THRESHOLD and adx_rising:
+        if adx >= settings.ADX_TRENDING_THRESHOLD:
             regime = "trending"
         elif adx >= settings.ADX_RANGING_THRESHOLD:
             regime = "transition"
