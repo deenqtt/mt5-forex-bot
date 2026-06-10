@@ -57,7 +57,6 @@ from strategy.indicators import IndicatorManager
 from strategy.ml_model import MLModel
 
 # Singletons — no MT5 init side effects now
-_ml_model   = MLModel()
 _analyzer   = AIAnalyzer()
 _engine     = OrderEngine()
 
@@ -215,7 +214,7 @@ async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await update.message.reply_text(f"Menganalisa {symbol_input.upper()}...")
 
     broker = MT5BrokerManager()
-    df     = broker.fetch_ohlcv(symbol_input, "1h", 100)
+    df     = broker.fetch_ohlcv(symbol_input, timeframe="5m", limit=200)
     
     if df.empty:
         # Check if the connection is actually alive
@@ -227,7 +226,7 @@ async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     # Use the first timestamp to confirm we got data
-    df_4h   = broker.fetch_ohlcv(symbol_input, "4h", 60)
+    df_htf  = broker.fetch_ohlcv(symbol_input, timeframe="1h", limit=100)
     df      = IndicatorManager.add_indicators(df)
     signals = IndicatorManager.get_latest_signals(df)
     if signals is None:
@@ -239,17 +238,19 @@ async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     real_symbol = session._ensure_symbol(symbol_input) or symbol_input
 
     htf = {"bias": "neutral", "regime": "unknown", "adx": 0.0, "ema_trend": "ranging", "dmp": 0, "dmn": 0}
-    if not df_4h.empty:
-        df_4h = IndicatorManager.add_indicators(df_4h)
-        htf   = IndicatorManager.get_htf_bias(df_4h)
+    if not df_htf.empty:
+        df_htf = IndicatorManager.add_indicators(df_htf)
+        htf   = IndicatorManager.get_htf_bias(df_htf)
 
-    prediction    = _ml_model.predict(df)
+    # Symbol-specific ML model
+    ml_model      = MLModel(symbol=real_symbol)
+    prediction    = ml_model.predict(df)
     analysis_text = _analyzer.analyze(real_symbol, signals, prediction)
 
     bias_emoji = {"bullish": "🟢", "bearish": "🔴", "neutral": "⚪"}.get(htf["bias"], "⚪")
     analysis_text += "\n" + "\n".join([
         "",
-        "═══ Higher Timeframe (4h) ═══",
+        "═══ Higher Timeframe (1h) ═══",
         f"{bias_emoji} Bias    : {htf['bias'].upper()}",
         f"   Regime : {htf['regime'].upper()}  (ADX {htf['adx']})",
         f"   EMA    : {htf['ema_trend']}  |  DI+ {htf['dmp']} / DI- {htf['dmn']}",
@@ -564,7 +565,9 @@ async def train_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     df      = IndicatorManager.add_indicators(df)
-    metrics = _ml_model.train(df)
+    # Symbol-specific ML model
+    ml_model = MLModel(symbol=symbol)
+    metrics  = ml_model.train(df)
 
     if "error" in metrics:
         await update.message.reply_text(f"❌ {metrics['error']}")

@@ -15,8 +15,14 @@ CONFIDENCE_THRESHOLD = 0.60
 
 
 class MLModel:
-    def __init__(self, model_path: str = settings.ML_MODEL_PATH) -> None:
-        self.model_path: str = model_path
+    def __init__(self, symbol: str | None = None) -> None:
+        if symbol:
+            # Ensure data directory exists
+            os.makedirs("data", exist_ok=True)
+            self.model_path = f"data/ml_model_{symbol.upper()}.joblib"
+        else:
+            self.model_path = settings.ML_MODEL_PATH
+            
         self._feature_cols: list[str] = []  # populated after train
         self.model = self._load_model()
 

@@ -1,0 +1,13 @@
+{
+  "enabled": true,
+  "symbols": [
+    "EURUSD",
+    "GBPUSD",
+    "USDJPY",
+    "XAUUSD"
+  ],
+  "timeframe": "1h",
+  "limit": 2000,
+  "schedule_day": 5,
+  "schedule_hour": 12
+}

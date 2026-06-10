@@ -37,6 +37,8 @@ Architecture changes from original:
 
 import logging
 import time
+import json
+import os
 from datetime import datetime, timezone
 
 from telegram.ext import ApplicationBuilder, CallbackQueryHandler, CommandHandler
@@ -61,8 +63,8 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-AUTO_SCAN_INTERVAL    = 60
-TP_MONITOR_INTERVAL   = 30
+AUTO_SCAN_INTERVAL    = 15  # Scalping: faster scans (15s)
+TP_MONITOR_INTERVAL   = 10  # Scalping: monitor TP/SL every 10s
 RECONCILE_INTERVAL    = settings.RECONCILE_INTERVAL  # 300s
 TOP_SYMBOLS_N         = settings.TOP_SYMBOLS_N
 TOP_SYMBOLS_CACHE_TTL = settings.TOP_SYMBOLS_CACHE_TTL
@@ -169,7 +171,9 @@ async def auto_trading_job(context) -> None:
         if not is_valid_session(symbol):
             continue
         try:
-            df = broker.fetch_ohlcv(symbol)
+            # Symbol-specific ML model
+            ml_model = MLModel(symbol=symbol)
+            df = broker.fetch_ohlcv(symbol, timeframe="5m", limit=200)
             if df.empty:
                 continue
             df      = IndicatorManager.add_indicators(df)
@@ -181,11 +185,11 @@ async def auto_trading_job(context) -> None:
             if abs(composite) < threshold:
                 continue
 
-            df_4h    = broker.fetch_ohlcv(symbol, "4h", 60)
+            df_htf   = broker.fetch_ohlcv(symbol, timeframe="1h", limit=100)
             htf_bias = "neutral"
-            if not df_4h.empty:
-                df_4h    = IndicatorManager.add_indicators(df_4h)
-                htf_bias = IndicatorManager.get_htf_bias(df_4h)["bias"]
+            if not df_htf.empty:
+                df_htf   = IndicatorManager.add_indicators(df_htf)
+                htf_bias = IndicatorManager.get_htf_bias(df_htf)["bias"]
 
             if composite > 0 and htf_bias != "bullish":
                 continue
@@ -240,7 +244,6 @@ async def auto_execute_job(context) -> None:
     from core.execution.order_engine import OrderEngine
 
     broker    = MT5BrokerManager()
-    ml_model  = MLModel()
     analyzer  = AIAnalyzer()
     engine    = OrderEngine()
     chat_id   = settings.TELEGRAM_CHAT_ID
@@ -271,6 +274,8 @@ async def auto_execute_job(context) -> None:
         if not is_valid_session(symbol):
             continue
         try:
+            # Symbol-specific ML model
+            ml_model = MLModel(symbol=symbol)
             await _execute_for_symbol(
                 symbol, context, broker, ml_model, analyzer, engine, chat_id
             )
@@ -320,7 +325,7 @@ async def _execute_for_symbol_locked(
         return
 
     # Signal pipeline
-    df = broker.fetch_ohlcv(symbol, "1h", 100)
+    df = broker.fetch_ohlcv(symbol, timeframe="5m", limit=200)
     if df.empty:
         return
     df      = IndicatorManager.add_indicators(df)
@@ -332,12 +337,12 @@ async def _execute_for_symbol_locked(
     if abs(composite) < threshold:
         return
 
-    # HTF 4H confirmation
-    df_4h    = broker.fetch_ohlcv(symbol, "4h", 60)
+    # HTF 1H confirmation (Scalping: 1H is high enough)
+    df_htf   = broker.fetch_ohlcv(symbol, timeframe="1h", limit=100)
     htf_bias = "neutral"
-    if not df_4h.empty:
-        df_4h    = IndicatorManager.add_indicators(df_4h)
-        htf_bias = IndicatorManager.get_htf_bias(df_4h)["bias"]
+    if not df_htf.empty:
+        df_htf   = IndicatorManager.add_indicators(df_htf)
+        htf_bias = IndicatorManager.get_htf_bias(df_htf)["bias"]
 
     if composite > 0 and htf_bias != "bullish":
         return
@@ -447,6 +452,73 @@ async def _execute_for_symbol_locked(
             f"/close {symbol} untuk exit manual."
         ),
     )
+
+
+async def auto_train_job(context) -> None:
+    """
+    Automatic ML training based on config/training.json.
+    Runs on scheduled day/hour (usually Saturday).
+    """
+    config_path = "config/training.json"
+    if not os.path.exists(config_path):
+        return
+
+    try:
+        with open(config_path, "r") as f:
+            config = json.load(f)
+    except Exception as exc:
+        log.error("Failed to load training config: %s", exc)
+        return
+
+    if not config.get("enabled", False):
+        return
+
+    now = datetime.now(timezone.utc)
+    # schedule_day: 0=Mon, 4=Fri, 5=Sat, 6=Sun
+    if now.weekday() != config.get("schedule_day", 5):
+        return
+    if now.hour != config.get("schedule_hour", 12):
+        return
+    # Run only once in the hour
+    if now.minute > 5:
+        return
+
+    from strategy.indicators import IndicatorManager
+    from strategy.ml_model import MLModel
+    from core.mt5_broker import MT5BrokerManager
+
+    broker = MT5BrokerManager()
+    symbols = config.get("symbols", ["EURUSD"])
+    tf = config.get("timeframe", "1h")
+    limit = config.get("limit", 2000)
+
+    log.info("Starting Auto-Training for symbols: %s", symbols)
+    results = []
+
+    for symbol in symbols:
+        try:
+            df = broker.fetch_ohlcv(symbol, tf, limit)
+            if df.empty:
+                results.append(f"❌ {symbol}: No data")
+                continue
+            
+            df = IndicatorManager.add_indicators(df)
+            ml_model = MLModel(symbol=symbol)
+            metrics = ml_model.train(df)
+            
+            if "error" in metrics:
+                results.append(f"❌ {symbol}: {metrics['error']}")
+            else:
+                results.append(f"✅ {symbol}: Acc {metrics['accuracy']:.2%}")
+        except Exception as exc:
+            log.error("Auto-train error for %s: %s", symbol, exc)
+            results.append(f"❌ {symbol}: Error")
+
+    if results:
+        await context.bot.send_message(
+            chat_id=settings.TELEGRAM_CHAT_ID,
+            text="🤖 AUTO-TRAINING REPORT\n\n" + "\n".join(results)
+        )
 
 
 # ── Job: Weekend position close ─────────────────────────────────────────────
@@ -634,6 +706,7 @@ if __name__ == "__main__":
     jq.run_repeating(reconcile_job,    interval=RECONCILE_INTERVAL,   first=60)
     jq.run_repeating(auto_trading_job, interval=AUTO_SCAN_INTERVAL,   first=10)
     jq.run_repeating(auto_execute_job, interval=AUTO_SCAN_INTERVAL,   first=20)
+    jq.run_repeating(auto_train_job,   interval=60,                   first=40)
     jq.run_repeating(weekend_close_job, interval=60,                  first=30)
 
     log.info("Forex Bot MT5 starting — polling Telegram")

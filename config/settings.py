@@ -21,8 +21,8 @@ IDR_TO_USD_RATE  = 16200.0 # Approximate rate for risk calculation
 
 # Risk Management
 DEFAULT_RISK_PERCENT  = 0.01    # 1% equity per trade
-DEFAULT_SL_PIPS       = 50      # pips
-DEFAULT_TP_PIPS       = 100     # pips (RR 2:1)
+DEFAULT_SL_PIPS       = 15      # pips (Scalping: tight SL)
+DEFAULT_TP_PIPS       = 30      # pips (RR 2:1)
 PIP_VALUE_USD         = 10.0    # USD per pip per standard lot (EURUSD)
 MIN_LOT               = 0.01
 MAX_LOT               = 10.0
@@ -30,9 +30,9 @@ MAX_LOT               = 10.0
 # JPY pairs use different pip multiplier (0.01 instead of 0.0001)
 JPY_PAIRS = {"USDJPY", "EURJPY", "GBPJPY", "CADJPY", "AUDJPY", "CHFJPY", "NZDJPY"}
 
-# ATR-based SL/TP
-ATR_SL_MULTIPLIER = 1.5
-ATR_TP_MULTIPLIER = 3.0
+# ATR-based SL/TP (Tightened for scalping)
+ATR_SL_MULTIPLIER = 1.0
+ATR_TP_MULTIPLIER = 2.0
 ATR_LENGTH        = 14
 
 # Market Regime (ADX)
@@ -75,7 +75,7 @@ RECONCILE_INTERVAL = 60    # every 1 minute
 # ML
 ML_MODEL_PATH               = "data/ml_model.joblib"
 ML_RANDOM_FOREST_ESTIMATORS = 100
-ML_TARGET_LOOKAHEAD_PERIODS = 5
+ML_TARGET_LOOKAHEAD_PERIODS = 12  # Predict 1 hour ahead for 5m TF
 ML_FEATURE_COLUMNS = [
     "rsi", "ema_20", "ema_50",
     "MACD_12_26_9", "MACDs_12_26_9", "MACDh_12_26_9",
