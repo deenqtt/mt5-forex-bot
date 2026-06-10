@@ -1,5 +1,4 @@
-1. Untuk auto trade nya itu agak janggal 
-nunggu lama bgt untuk kenal tp atau sl nya ? kira kira kenapa?? apakah analisa nya meleset??
-ini termasuk scalping lo bukan day trade atau swing trade 
+- Saat udah tp di dalam tele nya ga masukl notif
+- saat sl di tele masuk notif tpi malah masuknya itu dia ngomong tp bukan sl 
 
-2. udah nunggu lama lama kena sl juga wkwkw 
+- sama apakah dia itu auto scannya itu hardcode?? untuk symbol symbol nya?? atau bagaimana coba bantu di analisa 
