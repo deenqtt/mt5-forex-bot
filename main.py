@@ -61,6 +61,9 @@ logging.basicConfig(
     format="%(asctime)s %(name)s %(levelname)s %(message)s",
     level=logging.INFO,
 )
+# Suppress TA-Lib requirement warnings from pandas_ta
+logging.getLogger("pandas_ta").setLevel(logging.ERROR)
+
 log = logging.getLogger(__name__)
 
 AUTO_SCAN_INTERVAL    = 15  # Scalping: faster scans (15s)

@@ -39,6 +39,7 @@ TRADE_RETCODE_TRADE_DISABLED = 10017
 TRADE_RETCODE_MARKET_CLOSED  = 10018
 TRADE_RETCODE_INVALID_VOLUME = 10014
 TRADE_RETCODE_POSITION_CLOSED = 10009
+TRADE_RETCODE_AUTOTRADING_DISABLED = 10027
 
 # ── Order types ────────────────────────────────────────────────────────────
 ORDER_TYPE_BUY  = 0
@@ -88,6 +89,13 @@ class AccountInfo:
     server:   str   = "Stub-Server"
     currency: str   = "USD"
     leverage: int   = 100
+
+
+@dataclass
+class TerminalInfo:
+    connected:     bool = True
+    trade_allowed: bool = True
+    trade_expert:  bool = True
 
 
 @dataclass
@@ -156,6 +164,9 @@ def last_error() -> tuple[int, str]:
 
 def account_info() -> AccountInfo:
     return AccountInfo()
+
+def terminal_info() -> TerminalInfo:
+    return TerminalInfo()
 
 def symbol_info(symbol: str) -> SymbolInfo:
     return SymbolInfo(name=symbol)

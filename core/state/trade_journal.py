@@ -104,33 +104,39 @@ def record_close(
 def pnl_from_deal_history(position_id: int) -> tuple[float, str]:
     """
     Query MT5 deal history for the realized PnL of a closed position.
-    Returns (pnl_usd, source_tag).
-
-    This is the most accurate method — MT5 stores the broker's actual
-    net profit after commission and swap for each closing deal.
+    Returns (pnl_usd, source_tag). Normalized if account is IDR.
     """
     deals = session.get_deals_by_position(position_id)
     if not deals:
         return 0.0, "unknown"
 
-    # Closing deal has entry = DEAL_ENTRY_OUT
+    # Filter to only trade deals (ignore separate commission/swap deals if present)
+    # MT5 DEAL_TYPE_BUY=0, DEAL_TYPE_SELL=1
+    trade_deals = [d for d in deals if d.type in (mt5.DEAL_TYPE_BUY, mt5.DEAL_TYPE_SELL)]
+    
+    # Closing deal has entry = DEAL_ENTRY_OUT (1)
     close_deal = next(
-        (d for d in deals if d.entry == mt5.DEAL_ENTRY_OUT), None
+        (d for d in trade_deals if d.entry in (mt5.DEAL_ENTRY_OUT, mt5.DEAL_ENTRY_INOUT)),
+        None
     )
-    if close_deal is None:
-        # Some brokers use DEAL_ENTRY_INOUT for partial/full close
-        close_deal = next(
-            (d for d in deals if d.entry == mt5.DEAL_ENTRY_INOUT), None
-        )
 
+    raw_pnl = 0.0
     if close_deal:
-        pnl = float(close_deal.profit)
-        log.debug("Deal history PnL for position %d: $%.2f", position_id, pnl)
-        return pnl, "deal_history"
+        # Sum profit + swap + commission from the trade deals
+        raw_pnl = sum(float(d.profit) + float(d.swap) + float(d.commission) for d in trade_deals)
+        source  = "deal_history"
+    else:
+        # Fallback: sum everything
+        raw_pnl = sum(float(d.profit) + float(d.swap) + float(d.commission) for d in deals)
+        source  = "deal_history_sum"
 
-    # Fallback: sum all deal profits for this position
-    total = sum(float(d.profit) for d in deals)
-    return total, "deal_history_sum"
+    # Normalize to USD if account is IDR
+    if settings.ACCOUNT_CURRENCY == "IDR":
+        pnl_usd = round(raw_pnl / settings.IDR_TO_USD_RATE, 2)
+    else:
+        pnl_usd = round(raw_pnl, 2)
+
+    return pnl_usd, source
 
 
 def pnl_from_calc(
@@ -153,14 +159,17 @@ def pnl_from_calc(
 
 
 def classify_exit(
-    side: str, fill: float, exit_p: float, sl: float, tp: float
+    symbol: str, side: str, fill: float, exit_p: float, sl: float, tp: float
 ) -> str:
     """
     Classify why a trade closed.
-    Uses a tolerance of 0.5 pip (~0.00005 for non-JPY) to handle
-    broker rounding differences in SL/TP hit detection.
+    Uses a dynamic tolerance based on symbol's point size to handle
+    broker rounding differences (usually 2-3 points).
     """
-    tol = 0.00005
+    sym_info = session.get_symbol_info(symbol)
+    point    = float(sym_info.point) if sym_info else 0.00001
+    tol      = point * 10  # 10 points tolerance for crypto/volatility
+
     if side == "buy":
         if tp > 0 and exit_p >= tp - tol:  return "TP_Hit"
         if sl > 0 and exit_p <= sl + tol:  return "SL_Hit"

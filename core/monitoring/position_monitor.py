@@ -83,22 +83,23 @@ async def _handle_closed(ticket: int, record: dict, send_message_fn) -> None:
     side   = record["side"]
 
     # Query broker's actual PnL and exit price
+    pnl_usd, pnl_source = pnl_from_deal_history(ticket)
+    
     deals = session.get_deals_by_position(ticket)
     exit_price = float(record.get("fill_price", 0))  # fallback
-    pnl_usd    = 0.0
-    pnl_source = "unknown"
 
     if deals:
+        # For exit_price, we still need to find the specific closing deal
+        trade_deals = [d for d in deals if d.type in (mt5.DEAL_TYPE_BUY, mt5.DEAL_TYPE_SELL)]
         close_deal = next(
-            (d for d in deals if d.entry in (mt5.DEAL_ENTRY_OUT, mt5.DEAL_ENTRY_INOUT)),
+            (d for d in trade_deals if d.entry in (mt5.DEAL_ENTRY_OUT, mt5.DEAL_ENTRY_INOUT)),
             None,
         )
         if close_deal:
             exit_price = close_deal.price
-            pnl_usd    = close_deal.profit
-            pnl_source = "deal_history"
 
     exit_reason = classify_exit(
+        symbol=symbol,
         side=side,
         fill=float(record.get("fill_price", 0)),
         exit_p=exit_price,

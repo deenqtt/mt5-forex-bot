@@ -47,6 +47,7 @@ FATAL_CODES: frozenset[int] = frozenset({
     mt5.TRADE_RETCODE_MARKET_CLOSED,   # 10018 — market closed
     mt5.TRADE_RETCODE_INVALID_VOLUME,  # 10014 — volume out of range
     mt5.TRADE_RETCODE_POSITION_CLOSED, # 10036 — position already closed
+    10027,                             # TRADE_RETCODE_AUTOTRADING_DISABLED — "Algo Trading" button is OFF
 })
 
 
@@ -115,6 +116,8 @@ class MT5Session:
                         settings.MT5_LOGIN,
                         info.balance,
                     )
+                    if not term.trade_allowed:
+                        log.warning("CRITICAL: Algo Trading is DISABLED in MT5 terminal. Trades will fail (retcode 10027).")
                     return True
                 
                 code, msg = mt5.last_error()
@@ -153,7 +156,7 @@ class MT5Session:
     def _ping(self) -> bool:
         """
         Health check — verify terminal is initialized AND connected to server.
-        account_info() alone can return cached data even if disconnected.
+        Also verifies if trading is actually possible.
         """
         info = mt5.account_info()
         if info is None:
@@ -162,7 +165,14 @@ class MT5Session:
         term = mt5.terminal_info()
         if term is None or not term.connected:
             return False
-            
+
+        # Periodic check for trade permissions (warns if status changes)
+        if not term.trade_allowed:
+            log.warning("TRADING BLOCKED: 'Algo Trading' button is OFF in MT5 terminal.")
+        
+        if not info.trade_allowed:
+            log.warning("TRADING BLOCKED: Account trading disabled. Possible 'Investor Password' login?")
+
         return True
 
     def _ensure_symbol(self, symbol: str) -> str | None:

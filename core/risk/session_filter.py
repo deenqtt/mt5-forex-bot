@@ -57,16 +57,17 @@ def is_valid_session(symbol: str) -> bool:
 
     # Symbol-specific session windows
     if any(x in symbol for x in ("EUR", "GBP", "CHF")):
-        # European session: London open 07:00 – London+NY overlap close 20:00
-        return 7 <= hour < 20
+        # European + NY overlap: London open 07:00 – NY close 21:00
+        return 7 <= hour < 21
 
     if "JPY" in symbol:
         # Tokyo: 00:00–09:00, London: 07:00–16:00
-        return hour < 16
+        return hour < 16 or 0 <= hour < 9
 
     if "XAU" in symbol:
-        # Gold most liquid during London + NY: 07:00–21:00
-        return 7 <= hour < 21
+        # Gold trades 23/5. Allow all except daily rollover gap (21:00-22:00 UTC)
+        # and weekend (handled by global filter above).
+        return hour < 21 or hour >= 22
 
     if any(x in symbol for x in ("AUD", "NZD")):
         # Sydney: 22:00–07:00 UTC, London overlap: 07:00–09:00
