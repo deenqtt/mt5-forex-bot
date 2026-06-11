@@ -21,6 +21,7 @@ import logging
 
 from config import settings
 from core.connection.mt5_session import session
+from core.risk.session_detector import get_current_session
 
 log = logging.getLogger(__name__)
 
@@ -72,13 +73,15 @@ def is_spread_acceptable(symbol: str) -> bool:
     else:
         pip_size = 0.0001
 
-    spread_pips = spread_price / pip_size
-    max_pips    = _MAX_SPREAD_PIPS.get(symbol, _MAX_SPREAD_PIPS["DEFAULT"])
+    spread_pips  = spread_price / pip_size
+    base_max     = _MAX_SPREAD_PIPS.get(symbol, _MAX_SPREAD_PIPS["DEFAULT"])
+    sess         = get_current_session()
+    max_pips     = base_max * sess.spread_mult
 
     if spread_pips > max_pips:
         log.warning(
-            "SpreadFilter REJECT: %s spread=%.1f pip > max=%.1f pip",
-            symbol, spread_pips, max_pips,
+            "SpreadFilter REJECT: %s spread=%.1f pip > max=%.1f pip [%s base=%.1f ×%.2f]",
+            symbol, spread_pips, max_pips, sess.name, base_max, sess.spread_mult,
         )
         return False
 

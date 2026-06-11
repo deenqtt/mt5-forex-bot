@@ -68,7 +68,7 @@ log = logging.getLogger(__name__)
 
 AUTO_SCAN_INTERVAL    = 15  # Scalping: faster scans (15s)
 TP_MONITOR_INTERVAL   = 10  # Scalping: monitor TP/SL every 10s
-RECONCILE_INTERVAL    = settings.RECONCILE_INTERVAL  # 300s
+RECONCILE_INTERVAL    = settings.RECONCILE_INTERVAL  # 60s
 TOP_SYMBOLS_N         = settings.TOP_SYMBOLS_N
 TOP_SYMBOLS_CACHE_TTL = settings.TOP_SYMBOLS_CACHE_TTL
 
@@ -527,13 +527,15 @@ async def auto_train_job(context) -> None:
 # ── Job: Weekend position close ─────────────────────────────────────────────
 
 async def weekend_close_job(context) -> None:
-    """Close all positions Friday 14:00 UTC to avoid weekend gap risk."""
+    """
+    Close all positions Friday 14:00 UTC to avoid weekend gap risk.
+    Runs every 60s but is idempotent — exits early if no positions open.
+    No minute-window guard: if a partial close fails the job retries on next tick.
+    """
     now = datetime.now(timezone.utc)
     if now.weekday() != 4:          # not Friday
         return
-    if now.hour != settings.WEEKEND_CLOSE_HOUR_UTC:
-        return
-    if now.minute > 5:              # only within first 5 minutes of the hour
+    if now.hour < settings.WEEKEND_CLOSE_HOUR_UTC:
         return
 
     from core.mt5_broker import MT5BrokerManager

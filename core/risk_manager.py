@@ -7,6 +7,23 @@ from core.connection.mt5_session import session
 log = logging.getLogger(__name__)
 
 
+def _get_idr_usd_rate() -> float:
+    """
+    Fetch live USD/IDR rate from MT5 broker.
+    Exness lists it as "USDIDR" or "USDIDRm".
+    Falls back to settings constant if symbol unavailable.
+    """
+    for sym in ("USDIDR", "USDIDRm", "USDIDR."):
+        tick = session.get_tick(sym)
+        if tick and tick.bid > 0:
+            return float(tick.bid)
+    log.warning(
+        "Live USDIDR rate unavailable — using fallback %.0f (may cause lot sizing error)",
+        settings.IDR_TO_USD_RATE,
+    )
+    return settings.IDR_TO_USD_RATE
+
+
 class RiskManager:
     def __init__(self, balance: float) -> None:
         """
@@ -58,7 +75,7 @@ class RiskManager:
         # trade_tick_value is the profit/loss in ACCOUNT CURRENCY for 1 LOT when price moves by 1 TICK.
         # If account is IDR, tick_val is in IDR. We MUST normalize it to USD to match self.balance.
         if settings.ACCOUNT_CURRENCY == "IDR":
-            tick_val_usd = tick_val / settings.IDR_TO_USD_RATE
+            tick_val_usd = tick_val / _get_idr_usd_rate()
         else:
             tick_val_usd = tick_val
 
@@ -103,7 +120,7 @@ class RiskManager:
         tick_val, tick_size = tick_info
         
         if settings.ACCOUNT_CURRENCY == "IDR":
-            tick_val_usd = tick_val / settings.IDR_TO_USD_RATE
+            tick_val_usd = tick_val / _get_idr_usd_rate()
         else:
             tick_val_usd = tick_val
 

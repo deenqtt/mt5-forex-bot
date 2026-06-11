@@ -37,6 +37,7 @@ from config import settings
 from core.execution.order_engine import OrderEngine
 from core.mt5_broker import MT5BrokerManager
 from core.risk.circuit_breaker import circuit_breaker
+from core.risk.session_detector import session_summary
 from core.risk.session_filter import is_valid_session
 from core.risk_manager import RiskManager
 from core.state.position_store import (
@@ -439,6 +440,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     lines = [
         "📊 STATUS AKUN\n",
+        f"🕐 Sesi      : {session_summary()}",
         f"🔍 Auto Scan : {'🟢 ON' if auto_scan else '🔴 OFF'}",
         f"⚡ Auto Exec : {'🟢 ON' if auto_exec else '🔴 OFF'}",
         f"📊 Scan      : {scan_label}\n",
@@ -462,9 +464,9 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         lines.append(f"\n📈 Posisi Terbuka ({len(mt5_positions)}):")
         for p in mt5_positions:
             raw_pnl = float(p["unrealizedPnl"])
-            # Normalize unrealized PnL to USD if account is IDR
             if settings.ACCOUNT_CURRENCY == "IDR":
-                pnl = raw_pnl / settings.IDR_TO_USD_RATE
+                from core.risk_manager import _get_idr_usd_rate
+                pnl = raw_pnl / _get_idr_usd_rate()
             else:
                 pnl = raw_pnl
                 

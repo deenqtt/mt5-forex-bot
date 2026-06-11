@@ -30,7 +30,12 @@ class IndicatorManager:
         df["ATRr_14"] = ta.atr(df["high"], df["low"], df["close"], length=settings.ATR_LENGTH)
         df["atr_ma20"] = df["ATRr_14"].rolling(20).mean()
 
-        df.ta.cdl_pattern(name="all", append=True)
+        # Specific patterns relevant to scalping — avoids computing all 60+ patterns per tick
+        _CDL_SCALPING = [
+            "hammer", "invertedhammer", "shootingstar", "engulfing",
+            "doji", "morningstar", "eveningstar", "harami",
+        ]
+        df.ta.cdl_pattern(name=_CDL_SCALPING, append=True)
 
         return df
 

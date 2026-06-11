@@ -12,12 +12,10 @@ MT5_SERVER   = os.getenv("MT5_SERVER", "Exness-MT5Trial")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 
-# Gemini AI (optional)
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
 # Currency Handling
 ACCOUNT_CURRENCY = "IDR"  # Set to "USD" if your account is in USD
-IDR_TO_USD_RATE  = 16200.0 # Approximate rate for risk calculation
+IDR_TO_USD_RATE  = 16200.0  # Fallback rate — overridden at runtime by live USDIDR tick
 
 # Risk Management
 DEFAULT_RISK_PERCENT  = 0.01    # 1% equity per trade
@@ -75,9 +73,10 @@ RECONCILE_INTERVAL = 60    # every 1 minute
 # ML
 ML_MODEL_PATH               = "data/ml_model.joblib"
 ML_RANDOM_FOREST_ESTIMATORS = 100
-ML_TARGET_LOOKAHEAD_PERIODS = 12  # Predict 1 hour ahead for 5m TF
+ML_TARGET_LOOKAHEAD_PERIODS = 3   # 3 × 5m = 15 min — scalping-appropriate lookahead
 ML_FEATURE_COLUMNS = [
     "rsi", "ema_20", "ema_50",
     "MACD_12_26_9", "MACDs_12_26_9", "MACDh_12_26_9",
     "ADX_14", "DMP_14", "DMN_14", "ATRr_14",
+    "BBP_20_2.0",  # BB percent — used in signal logic, must match ML features
 ]

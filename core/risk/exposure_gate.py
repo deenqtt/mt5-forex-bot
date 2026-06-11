@@ -40,6 +40,7 @@ import MetaTrader5 as mt5
 
 from config import settings
 from core.connection.mt5_session import session
+from core.risk.session_detector import get_current_session
 from core.state.position_store import (
     count_open_positions,
     get_all_positions,
@@ -96,13 +97,16 @@ def check_entry(symbol: str, risk_usd: float, sl: float = 0.0, tp: float = 0.0) 
             f"{symbol} already has {len(mt5_symbol_positions)} position(s) in MT5: {tickets}",
         )
 
-    # ── Layer 2: Total open position count ───────────────────────────────
+    # ── Layer 2: Total open position count (session-aware cap) ───────────
     # Use local store for count (faster, and Layer 1 already verified MT5 state)
-    open_count = count_open_positions()
-    if open_count >= MAX_OPEN_POSITIONS:
+    # Session cap is min(global max, session max) — never exceeds global limit.
+    open_count  = count_open_positions()
+    sess        = get_current_session()
+    session_cap = min(MAX_OPEN_POSITIONS, sess.max_positions)
+    if open_count >= session_cap:
         return GateResult(
             False,
-            f"Jumlah posisi maksimal tercapai ({open_count}/{MAX_OPEN_POSITIONS}).",
+            f"Position cap [{sess.label}]: {open_count}/{session_cap} posisi.",
         )
 
     # ── Layer 3: Total risk % of equity ──────────────────────────────────

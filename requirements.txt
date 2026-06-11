@@ -17,3 +17,8 @@ python-dotenv>=1.0.0
 # pandas_ta>=0.3.14b
 tqdm>=4.67.1
 colorama>=0.4.6
+
+# Optional — AutoML Research Pipeline (ml_research/)
+# Install manually: pip install optuna lightgbm
+# optuna>=3.0.0
+# lightgbm>=4.0.0
