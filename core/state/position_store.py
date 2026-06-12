@@ -93,6 +93,7 @@ def open_position(
     lot_size:       float,
     risk_usd:       float,
     equity_at_open: float,
+    atr_at_open:    float = 0.0,
 ) -> None:
     """
     Record a newly opened position.
@@ -118,15 +119,32 @@ def open_position(
             "lot_size":       lot_size,
             "risk_usd":       risk_usd,
             "equity_at_open": equity_at_open,
+            "atr_at_open":    atr_at_open,
+            "be_applied":     False,
             "opened_at":      datetime.utcnow().isoformat(),
             "date":           date.today().isoformat(),
             "source":         "bot",
         }
         _save(data)
         log.info(
-            "PositionStore: opened ticket=%d %s %s @ %.5f  SL=%.5f TP=%.5f",
-            ticket, side.upper(), symbol, fill_price, sl_price, tp_price,
+            "PositionStore: opened ticket=%d %s %s @ %.5f  SL=%.5f TP=%.5f ATR=%.5f",
+            ticket, side.upper(), symbol, fill_price, sl_price, tp_price, atr_at_open,
         )
+
+
+def update_position_field(ticket: int, field: str, value: any) -> bool:
+    """
+    Updates a specific field in a position record (e.g., be_applied=True).
+    Returns True if updated, False if ticket not found.
+    """
+    with _STORE_LOCK:
+        data = _load()
+        key  = str(ticket)
+        if key in data:
+            data[key][field] = value
+            _save(data)
+            return True
+        return False
 
 
 def remove_position(ticket: int) -> dict | None:

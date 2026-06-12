@@ -172,7 +172,7 @@ def _select_feature_cols(df: pd.DataFrame) -> list[str]:
 def _build_xy(df: pd.DataFrame, feature_cols: list[str]) -> tuple[pd.DataFrame, pd.Series]:
     """
     Build feature matrix + ATR-scaled binary target.
-    Target: price rises by >= 0.5×ATR in next ML_TARGET_LOOKAHEAD_PERIODS candles.
+    Target: price rises by >= 1.0×ATR in next ML_TARGET_LOOKAHEAD_PERIODS candles.
     Features use current candle data — execution on next candle open (handled in backtest).
     """
     df = df.copy()
@@ -183,7 +183,7 @@ def _build_xy(df: pd.DataFrame, feature_cols: list[str]) -> tuple[pd.DataFrame, 
         df["_target"] = np.where(df["close"].shift(-lookahead) > df["close"], 1, 0)
     else:
         future_change = df["close"].shift(-lookahead) - df["close"]
-        df["_target"] = np.where(future_change >= atr * 0.5, 1, 0)
+        df["_target"] = np.where(future_change >= atr * 1.0, 1, 0)
 
     df = df.iloc[:-lookahead].copy()
     df = df.dropna(subset=feature_cols + ["_target"])

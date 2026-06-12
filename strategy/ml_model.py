@@ -59,7 +59,7 @@ class MLModel:
 
     def train(self, df: pd.DataFrame) -> dict:
         """
-        Train with 80/20 split. Target: price rises by ≥ 0.5×ATR in next N candles.
+        Train with 80/20 split. Target: price rises by ≥ 1.0×ATR in next N candles.
         Returns metrics dict for reporting.
         """
         df = df.copy()
@@ -71,7 +71,7 @@ class MLModel:
             # Fallback: simple directional target
             df["target"] = np.where(df["close"].shift(-lookahead) > df["close"], 1, 0)
         else:
-            min_move = atr * 0.5
+            min_move = atr * 1.0
             future_change = df["close"].shift(-lookahead) - df["close"]
             df["target"] = np.where(future_change >= min_move, 1, 0)
 

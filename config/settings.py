@@ -29,8 +29,8 @@ MAX_LOT               = 10.0
 JPY_PAIRS = {"USDJPY", "EURJPY", "GBPJPY", "CADJPY", "AUDJPY", "CHFJPY", "NZDJPY"}
 
 # ATR-based SL/TP (Tightened for scalping)
-ATR_SL_MULTIPLIER = 1.0
-ATR_TP_MULTIPLIER = 2.0
+ATR_SL_MULTIPLIER = 1.5
+ATR_TP_MULTIPLIER = 3.0
 ATR_LENGTH        = 14
 
 # Market Regime (ADX)
@@ -73,7 +73,7 @@ RECONCILE_INTERVAL = 60    # every 1 minute
 # ML
 ML_MODEL_PATH               = "data/ml_model.joblib"
 ML_RANDOM_FOREST_ESTIMATORS = 100
-ML_TARGET_LOOKAHEAD_PERIODS = 3   # 3 × 5m = 15 min — scalping-appropriate lookahead
+ML_TARGET_LOOKAHEAD_PERIODS = 6   # 6 × 5m = 30 min — more robust scalping lookahead
 ML_FEATURE_COLUMNS = [
     "rsi", "ema_20", "ema_50",
     "MACD_12_26_9", "MACDs_12_26_9", "MACDh_12_26_9",

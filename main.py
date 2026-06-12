@@ -92,17 +92,25 @@ def _compute_composite(signals: dict) -> tuple[int, int]:
     """Returns (composite_score, threshold). |score| must reach threshold to act."""
     regime = signals.get("regime", "transition")
     rsi    = signals.get("rsi", 50.0)
+    adx_rising = signals.get("adx_rising", False)
 
     if regime == "trending":
         ema_s = 1 if signals["ema_trend"] == "bullish" else (-1 if signals["ema_trend"] == "bearish" else 0)
-        rsi_s = 1 if rsi >= 55 else (-1 if rsi <= 45 else 0)
+        # Tighten RSI: 60/40 for trend confirmation
+        rsi_s = 1 if rsi >= 60 else (-1 if rsi <= 40 else 0)
         dmp, dmn = signals.get("dmp", 0), signals.get("dmn", 0)
         di_s  = 1 if dmp > dmn else (-1 if dmn > dmp else 0)
-        return ema_s + rsi_s + di_s, 2
+        
+        # Momentum bonus: only reward if ADX is rising
+        mom_s = 1 if adx_rising else 0
+        
+        return ema_s + rsi_s + di_s + mom_s, 3  # Higher threshold for quality
 
     elif regime == "ranging":
-        rsi_s = 1 if rsi <= 35 else (-1 if rsi >= 65 else 0)
-        bb_s  = 1 if signals.get("bb_percent", 0.5) <= 0.15 else (-1 if signals.get("bb_percent", 0.5) >= 0.85 else 0)
+        # Tighten Mean Reversion: 30/70 RSI and 0.1/0.9 BB
+        rsi_s = 1 if rsi <= 30 else (-1 if rsi >= 70 else 0)
+        bb_p  = signals.get("bb_percent", 0.5)
+        bb_s  = 1 if bb_p <= 0.10 else (-1 if bb_p >= 0.90 else 0)
         return rsi_s + bb_s, 2
 
     else:  # transition — no entry
@@ -430,6 +438,7 @@ async def _execute_for_symbol_locked(
         lot_size=fill.volume,
         risk_usd=risk_usd,
         equity_at_open=equity,
+        atr_at_open=atr,
     )
 
     # Notification — prediction already computed above (ML gate)

@@ -128,6 +128,51 @@ async def _handle_closed(ticket: int, record: dict, send_message_fn) -> None:
     )
 
 
+async def _check_break_even(record: dict, mt5_pos, send_message_fn) -> None:
+    """
+    If profit reaches 1.0 * atr_at_open, move SL to fill_price + 1 pip.
+    Protects trade from turning into a loss after significant favorable move.
+    """
+    ticket = record["ticket"]
+    symbol = record["symbol"]
+    side   = record["side"]
+    entry  = float(record.get("fill_price", 0))
+    atr    = float(record.get("atr_at_open", 0))
+    be_applied = record.get("be_applied", False)
+
+    # Skip if no ATR info or BE already applied
+    if atr <= 0 or be_applied:
+        return
+
+    cur = float(mt5_pos.price_current)
+    profit_points = (cur - entry) if side == "buy" else (entry - cur)
+
+    # Trigger BE at 1.0x ATR profit
+    if profit_points >= atr:
+        if symbol in settings.JPY_PAIRS:
+            pip_mult = 0.01
+        elif "XAU" in symbol:
+            pip_mult = 0.01
+        else:
+            pip_mult = 0.0001
+
+        # Move SL to entry + 1 pip buffer
+        new_sl = entry + pip_mult if side == "buy" else entry - pip_mult
+        tp     = float(record.get("planned_tp", 0))
+
+        log.info("BreakEven Triggered: %s ticket=%d at %.5f (profit=%.5f >= atr=%.5f)", 
+                 symbol, ticket, cur, profit_points, atr)
+
+        ok = _engine.modify_sl_tp(ticket, sl=new_sl, tp=tp)
+        if ok:
+            update_position_field(ticket, "be_applied", True)
+            await send_message_fn(
+                f"🛡️  BREAK EVEN — {symbol}\n\n"
+                f"Profit mencapai 1.0× ATR ({profit_points/pip_mult:.1f} pip).\n"
+                f"SL dipindah ke Entry +1 pip untuk mengunci risiko."
+            )
+
+
 async def _check_proximity(
     ticket_str: str,
     record: dict,
